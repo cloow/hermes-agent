@@ -915,11 +915,13 @@ export function paneRootSide(paneId: string): null | TreeSide {
 /** Collect all pane IDs on a given root-row side (left/right). */
 export function getPanesOnSide(tree: LayoutNode, side: 'left' | 'right'): string[] {
   const row = tree.type === 'split' && tree.orientation === 'row' ? tree : null
+
   if (!row) {
     return []
   }
 
   const panes = registry.getArea('panes')
+
   const mainIndices = row.children.flatMap((child, i) =>
     allPaneIds(child).some(
       id =>
@@ -934,9 +936,10 @@ export function getPanesOnSide(tree: LayoutNode, side: 'left' | 'right'): string
     return []
   }
 
-  const sideIndices = side === 'left'
-    ? row.children.slice(0, mainIndices[0])
-    : row.children.slice(mainIndices[mainIndices.length - 1] + 1)
+  const sideIndices =
+    side === 'left'
+      ? row.children.slice(0, mainIndices[0])
+      : row.children.slice(mainIndices[mainIndices.length - 1] + 1)
 
   return sideIndices.flatMap(allPaneIds)
 }
@@ -964,6 +967,7 @@ export function dismissTreePane(paneId: string) {
 
     if (minimizedNext !== next) {
       commit(minimizedNext)
+
       return
     }
   }

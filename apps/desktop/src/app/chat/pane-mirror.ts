@@ -133,11 +133,14 @@ export function paneMirror<T>(cfg: PaneMirror<T>): () => void {
     // missed because the group was already minimized.
     const allPrefixPanes = treePanesWithPrefix(`${cfg.prefix}:`)
     const livePanes = registry.getArea('panes')
+
     for (const id of allPrefixPanes) {
       const key = id.slice(cfg.prefix.length + 1)
+
       if (!wanted.has(key)) {
         // Already removed above, but double-check it's actually gone
         const stillExists = livePanes.some(c => c.id === id)
+
         if (stillExists) {
           removeTreePane(id)
         }

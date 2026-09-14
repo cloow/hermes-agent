@@ -178,9 +178,11 @@ export function openSession(
   // fronting a side tile (which feels like a dead click).
   // Exception: if already 'main' AND not on a page, no navigation needed.
   const focused = focusOpenSession(storedSessionId, workspaceScope)
-  const shouldNavigateToMain = intent === 'in-place'
-    ? focused !== 'main' || $workspaceIsPage.get()  // sidebar click: load into main unless already main AND not on a page
-    : focusedSessionNeedsRoute(focused, $workspaceIsPage.get()) // other intents: existing logic
+
+  const shouldNavigateToMain =
+    intent === 'in-place'
+      ? focused !== 'main' || $workspaceIsPage.get() // sidebar click: load into main unless already main AND not on a page
+      : focusedSessionNeedsRoute(focused, $workspaceIsPage.get()) // other intents: existing logic
 
   if (shouldNavigateToMain) {
     navigate(sessionRoute(storedSessionId))
