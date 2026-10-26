@@ -34,6 +34,7 @@ import {
   opacityNeedsSetting,
   resolveTranslucency,
   setTranslucencyValues,
+  supportedTranslucency,
   TRANSLUCENCY_CURVE,
   TRANSLUCENCY_MAX,
   TRANSLUCENCY_MIN,
@@ -703,5 +704,59 @@ describe('resolving the book for the painted appearance', () => {
 
     expect(resolveTranslucency(book, 'light', false).mode).toBe('clear')
     expect(resolveTranslucency(book, 'dark', false).mode).toBe('clear')
+  })
+})
+
+/**
+ * Linux reports no translucency support, so Settings hides the row — but the
+ * X11 window manager DOES honour `setOpacity` (_NET_WM_WINDOW_OPACITY; a
+ * migrated Linux window was measured at 239/255 = clear 29). The defaults
+ * table has no Linux row, so without a gate an untouched profile resolved to
+ * the macOS default (clear at 29%) and main faded the window with no control
+ * left to undo it. Every state main acts on passes through this gate.
+ */
+describe('translucency on a platform that cannot offer it', () => {
+  const linuxFile = { intensity: 29, fade: 0, mode: 'clear', material: 'titlebar', scope: 'sidebar' }
+
+  it('is unsupported on linux', () => {
+    expect(translucencySupportedOn('linux')).toBe(false)
+  })
+
+  it('forces a persisted translucency.json from the field fully opaque', () => {
+    const state = supportedTranslucency(normalizeState(linuxFile, false), false)
+
+    expect(state).toMatchObject({ intensity: 0, fade: 0, mode: 'clear' })
+    expect(windowOpacityFor(state)).toBe(1)
+    expect(windowOpacityOptions(state)).toEqual({})
+  })
+
+  it('forces the first-launch default fully opaque', () => {
+    for (const appearance of ['light', 'dark'] as const) {
+      const state = supportedTranslucency(defaultTranslucencyState(appearance, false, false), false)
+
+      expect(windowOpacityFor(state)).toBe(1)
+      expect(windowOpacityOptions(state)).toEqual({})
+    }
+  })
+
+  it('forces an untouched book opaque in either appearance', () => {
+    const book = normalizeBook({ mode: 'clear', base: {}, light: {}, dark: {} }, false)
+
+    for (const appearance of ['light', 'dark'] as const) {
+      expect(windowOpacityFor(supportedTranslucency(resolveTranslucency(book, appearance, false), false))).toBe(1)
+    }
+  })
+
+  it('forces a glass fade sent over IPC opaque too', () => {
+    const state = supportedTranslucency(normalizeState({ intensity: 50, fade: 60, mode: 'glass' }, false), false)
+
+    expect(glassActive(state)).toBe(false)
+    expect(windowOpacityFor(state)).toBe(1)
+  })
+
+  it('leaves supported platforms exactly as they were', () => {
+    const tuned = { ...clear(40), fade: 10 }
+
+    expect(supportedTranslucency(tuned, true)).toBe(tuned)
   })
 })

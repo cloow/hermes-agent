@@ -6,8 +6,10 @@
  * shows through:
  *
  * - 'clear' — the main process maps the lever to native window opacity
- *   (`setOpacity`), so the whole window fades, text included. macOS + Windows;
- *   `setOpacity` is a no-op on Linux.
+ *   (`setOpacity`), so the whole window fades, text included. macOS + Windows
+ *   only. Linux does not offer it, but note that X11 window managers DO honour
+ *   `setOpacity` (via _NET_WM_WINDOW_OPACITY), so an unsupported platform
+ *   must be forced opaque — see `supportedTranslucency`.
  * - 'glass' — the window stays fully opaque at the native level and the
  *   renderer thins its page surfaces instead, letting a platform material
  *   read as a matte blur while text keeps full contrast. macOS rides
@@ -142,8 +144,10 @@ const DEFAULT_VALUES: Record<'mac' | 'windows', Record<Appearance, TranslucencyV
 }
 
 /**
- * The untouched values for an appearance on this platform. Linux never reaches
- * here — translucency is unsupported there, so nothing resolves.
+ * The untouched values for an appearance on a platform that supports
+ * translucency. There is deliberately no Linux row: unsupported platforms
+ * still resolve through here, and `supportedTranslucency` is what turns the
+ * result off there.
  */
 export function defaultTranslucencyValues(appearance: Appearance, isWindows: boolean): TranslucencyValues {
   return DEFAULT_VALUES[isWindows ? 'windows' : 'mac'][appearance]
@@ -362,6 +366,24 @@ export function resolveTranslucency(
     material: slot.material ?? book.base.material ?? fallback.material,
     scope: slot.scope ?? book.base.scope ?? fallback.scope
   }
+}
+
+/**
+ * The state a platform can actually honour. Where translucency is unsupported
+ * (Linux, the browser host) every lever is OFF, whatever the book or the
+ * persisted file says.
+ *
+ * Settings hides the row on those platforms, so any non-zero value that
+ * reaches here — the macOS default the empty book falls back to, a value
+ * carried in from a migrated profile, a stale translucency.json — would fade
+ * the window with no control left to undo it. And "setOpacity does nothing on
+ * Linux" is not a safe gate: X11 honours it.
+ *
+ * Applied at resolution, not by rewriting the book, so the user's stored
+ * values are never destroyed. Supported platforms get the same object back.
+ */
+export function supportedTranslucency(state: TranslucencyState, translucencySupported: boolean): TranslucencyState {
+  return translucencySupported ? state : { ...state, intensity: TRANSLUCENCY_MIN, fade: TRANSLUCENCY_MIN }
 }
 
 /**

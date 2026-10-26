@@ -35,6 +35,7 @@ import {
   normalizeScope,
   resolveTranslucency,
   setTranslucencyValues,
+  supportedTranslucency,
   TRANSLUCENCY_MAX,
   TRANSLUCENCY_MIN,
   TRANSLUCENCY_STEP,
@@ -76,9 +77,10 @@ export const GLASS_SUPPORTED =
     : isMacPlatform() || isWindowsPlatform())
 
 /**
- * Whether the setting is worth showing at all. Linux has neither half —
- * `setOpacity` is a documented no-op and there is no native material — so
- * Settings hides the row rather than offering a lever that does nothing.
+ * Whether the setting is worth showing at all. Linux has no native glass
+ * material and Electron documents opacity as unsupported (X11 still honours
+ * it, so `supportedTranslucency` forces it off). Settings hides the row rather
+ * than offering a control the platform cannot reliably support.
  */
 export const TRANSLUCENCY_SUPPORTED =
   !isBrowserHostedDesktop() &&
@@ -117,9 +119,14 @@ export function setAppearance(appearance: Appearance): void {
   }
 }
 
-/** The resolved state for the painted appearance — the shape every consumer reads. */
+/**
+ * The resolved state for the painted appearance — the shape every consumer
+ * reads, and what is mirrored to main (which persists it and sets the native
+ * opacity). Forced off where translucency is unsupported: the row is hidden
+ * there, so nothing may fade the window behind the user's back.
+ */
 export const $translucency = computed([$translucencyBook, $appearance], (book, appearance) =>
-  resolveTranslucency(book, appearance, isWindowsPlatform())
+  supportedTranslucency(resolveTranslucency(book, appearance, isWindowsPlatform()), TRANSLUCENCY_SUPPORTED)
 )
 
 /** Write an edit against the appearance being painted. */

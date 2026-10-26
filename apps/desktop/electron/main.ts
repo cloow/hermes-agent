@@ -580,6 +580,8 @@ import {
   glassSupportedOn,
   normalizeState as normalizeTranslucency,
   opacityNeedsSetting,
+  supportedTranslucency,
+  type TranslucencyState,
   translucencySupportedOn,
   vibrancyFor as vibrancyForTranslucency,
   windowBackgroundMaterialOptions,
@@ -737,8 +739,9 @@ const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
 // Glass: macOS vibrancy, or Windows 11 22H2+ system backdrop. Computed once
 // so the renderer, the persisted default, and every chat window agree.
 const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
-// Clear rides setOpacity, a documented no-op on Linux, so neither mode works
-// there and Settings drops the row entirely.
+// macOS + Windows only. Settings drops the row elsewhere, so every state main
+// acts on is forced opaque there (see platformTranslucency) — X11 honours
+// setOpacity despite Electron documenting it as unsupported on Linux.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
 const APP_ROOT = app.getAppPath()
 
@@ -1498,19 +1501,32 @@ nativeTheme.themeSource = readPersistedThemeSource()
 // — a matte blur with full-contrast text. macOS uses vibrancy; Windows 11
 // uses DWM acrylic/mica/tabbed. Persisted so a cold launch applies it at
 // window creation, before the renderer reports its value.
-// macOS + Windows only; `setOpacity` is a no-op on Linux.
+// macOS + Windows only. On Linux Electron documents `setOpacity` as
+// unsupported, but X11 window managers honour it (_NET_WM_WINDOW_OPACITY), so
+// with no visible setting a stray value would fade the window irrecoverably.
 const TRANSLUCENCY_CONFIG_PATH = path.join(app.getPath('userData'), 'translucency.json')
+
+// Every state main acts on — the persisted file, the first-launch default and
+// each renderer send — passes through here, so an unsupported platform is
+// opaque regardless of what the renderer or a migrated file says.
+function platformTranslucency(state: TranslucencyState): TranslucencyState {
+  return supportedTranslucency(state, TRANSLUCENCY_SUPPORTED)
+}
 
 function readPersistedTranslucency() {
   try {
-    return normalizeTranslucency(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')), GLASS_SUPPORTED)
+    return platformTranslucency(
+      normalizeTranslucency(JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, 'utf8')), GLASS_SUPPORTED)
+    )
   } catch {
     // Nothing persisted yet — a first launch. Glass ships on, so the FIRST
     // window has to be created with the glass backing already: a window born
     // opaque cannot reliably be swapped to glass afterwards (see
     // windowBackingOptions). nativeTheme is the only appearance signal main
     // has this early; the renderer's first resolved send corrects it.
-    return defaultTranslucencyState(nativeTheme.shouldUseDarkColors ? 'dark' : 'light', GLASS_SUPPORTED, IS_WINDOWS)
+    return platformTranslucency(
+      defaultTranslucencyState(nativeTheme.shouldUseDarkColors ? 'dark' : 'light', GLASS_SUPPORTED, IS_WINDOWS)
+    )
   }
 }
 
@@ -16791,7 +16807,7 @@ ipcMain.on('hermes:feature-flags', (event: IpcMainEvent): void => {
 })
 
 ipcMain.on('hermes:translucency', (_event, payload) => {
-  const next = normalizeTranslucency(payload, GLASS_SUPPORTED)
+  const next = platformTranslucency(normalizeTranslucency(payload, GLASS_SUPPORTED))
   const previous = translucencyState
 
   if (

@@ -64,6 +64,7 @@ export {
   normalizeState,
   resolveTranslucency,
   setTranslucencyValues,
+  supportedTranslucency,
   TRANSLUCENCY_CURVE,
   TRANSLUCENCY_MAX,
   TRANSLUCENCY_MIN,
