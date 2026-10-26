@@ -67,7 +67,23 @@ def resolve_local_target(authority, actor, sid):
         authority.authorize(actor, ref, 'session:read')
         from gateway.session_local_recovery import restore_local_session
         return restore_local_session(authority, ref.session_id) if bound else ref
+    from hermes_state_local_migration import imported_local_surface
+    if row['source'] == 'local' and imported_local_surface(row) is None:
+        # An import with no known creating surface has none to adopt onto: its claimant reads it
+        # through the read-only history mount (``mount_history``), everyone else finds nothing.
+        ref = SessionRef(authority.profile_id, sid)
+        authority.authorize(actor, ref, 'session:read')
+        return ref
     return adopt_legacy_session(authority, actor, row)
+
+
+def _virtual_facade(provider, base_url):
+    """Whether *base_url* is exactly the built-in facade of the virtual *provider* (``moa`` ->
+    ``moa://local``). Any other non-http URL stays an endpoint, which build_policy refuses."""
+    from hermes_cli.providers import HERMES_OVERLAYS, normalize_provider
+    overlay = HERMES_OVERLAYS.get(normalize_provider(provider or ''))
+    return bool(overlay and overlay.auth_type == 'virtual' and isinstance(base_url, str)
+                and base_url.strip().rstrip('/') == overlay.base_url_override)
 
 
 def legacy_launch_params(row):
@@ -92,6 +108,11 @@ def legacy_launch_params(row):
         # an endpoint left without a provider is a custom route, never one to pair with the
         # profile's provider.
         route.setdefault('provider', 'custom')
+    if _virtual_facade(route.get('provider'), route.get('base_url')):
+        # MoA's ``moa://local`` (its billing stamp and gateway_runtime record both carry it) is how the
+        # virtual provider binds its own runtime, not an endpoint the session pinned: the route is the
+        # provider, and the saved model names its preset, as a native create with that provider records it.
+        del route['base_url']
     if row['source'] == 'acp' and 'cwd' not in params and Path(str(saved.get('cwd') or '')).is_absolute():
         params['cwd'] = saved['cwd']
     params.update({key: route[key] for key in ('provider', 'base_url') if key in route})
@@ -238,8 +259,8 @@ def adopt_legacy_session(authority, actor, row):
     if (getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) != actor
             or not {'session:read', 'session:create'} <= actor.capabilities):
         raise RuntimeStoreError('not_found')
-    from hermes_state_local_migration import LEGACY_CREATION_SOURCES, validate_legacy_row
-    validate_legacy_row(authority.db, row, subject=actor.subject)
+    from hermes_state_local_migration import LEGACY_CREATION_SOURCES, imported_local_surface, validate_legacy_row
+    validate_legacy_row(authority.db, row, subject=actor.subject, profile_id=actor.profile_id)
     authority._require_admission_open()
     from gateway.run import _load_gateway_config, _resolve_gateway_model
     from gateway.session_policy import build_policy, bind_launch_key
@@ -250,7 +271,9 @@ def adopt_legacy_session(authority, actor, row):
     request_id = 'legacy:' + row['id']
     sid = row['id']
     params, api_mode = legacy_launch_params(row)
-    params['source'] = LEGACY_CREATION_SOURCES.get(row['source'], row['source'])
+    # A claimed import adopts onto the surface that created it; its stored ``local`` label stays.
+    params['source'] = (imported_local_surface(row) if row['source'] == 'local'
+                        else LEGACY_CREATION_SOURCES.get(row['source'], row['source']))
     private = {}
     config = _load_gateway_config()
     params, api_mode = legacy_bot_chat_launch(row, params, api_mode, config)

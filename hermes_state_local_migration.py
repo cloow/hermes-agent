@@ -15,6 +15,45 @@ LEGACY_PREFIX = 'gateway.local_legacy.v1:'
 LEGACY_LOCAL_SOURCES = frozenset({'cli', 'tui', 'gui', 'desktop', 'oneshot', 'tool', 'acp'})
 # Legacy labels that are not creation sources of their own (session_policy.SURFACES).
 LEGACY_CREATION_SOURCES = {'desktop': 'gui'}
+# A gateway-local row (``source='local'``) an import carried here routeless: the creating surface its
+# ``created_source`` names (session_policy.created_surface, inverted). ``unknown`` names none.
+IMPORTED_LOCAL_SURFACES = {'cli': 'cli', 'tui': 'tui', 'desktop': 'gui', 'acp': 'acp'}
+
+
+def imported_local_surface(row):
+    return IMPORTED_LOCAL_SURFACES.get(row.get('created_source'))
+
+
+def unclaimed_history(conn, session_id):
+    """Nothing but its transcript names *session_id* here: no local, legacy or API receipt, no
+    admission (of any status), no retirement fence. An import copies none of these."""
+    from hermes_state_local import API_BINDING_PREFIX, POLICY_PREFIX
+    from hermes_state_mutation_retirement import RETIRED_PREFIX
+    keys = [prefix + session_id for prefix in (POLICY_PREFIX, LEGACY_PREFIX, API_BINDING_PREFIX, RETIRED_PREFIX)]
+    return (conn.execute('SELECT 1 FROM state_meta WHERE key IN (?,?,?,?)', keys).fetchone() is None
+            and conn.execute('SELECT 1 FROM session_admissions WHERE target_session_id=?',
+                             (session_id,)).fetchone() is None)
+
+
+def local_import_owned_by(db, conn, row, subject):
+    """Whether *row* is imported gateway-local history of *subject*: routeless, this profile's, stamped
+    with exactly that principal, and unclaimed (:func:`unclaimed_history`). A native local session
+    is never routeless, and its receipt and admissions name it."""
+    return (row['source'] == 'local' and bool(subject) and row.get('user_id') == subject
+            and not any(row.get(k) for k in ('session_key', 'chat_id', 'origin_json'))
+            and row.get('profile_name') in (None, '', db._own_profile_name() or 'default')
+            and unclaimed_history(conn, row['id']))
+
+
+def claimed_local_import(db, row, *, subject, profile_id, conn=None):
+    """:func:`local_import_owned_by`, and its owner claimed it (``session.mutate claim``): it carries
+    exactly that principal's import binding for *profile_id*. Never true without the binding."""
+    if conn is None:
+        with db._read_ctx() as conn:
+            return claimed_local_import(db, row, subject=subject, profile_id=profile_id, conn=conn)
+    from hermes_state_mutation_binding import history_binding
+    return (bool(profile_id) and local_import_owned_by(db, conn, row, subject)
+            and history_binding(conn, row['id']) == json.dumps([profile_id, subject], separators=(',', ':')))
 
 
 def legacy_account_label(row):
@@ -41,12 +80,19 @@ def login_owned_by(row, subject):
     return _login_label(subject) == user_id
 
 
-def validate_legacy_row(db, row, *, subject=None):
+def validate_legacy_row(db, row, *, subject=None, profile_id=None, conn=None):
     # Unrouted old local history only. Existing identity, foreign profile,
     # API, messaging, delegate and canonical rows require their own authority.
     # ``subject``: the adopting caller, whose own login stamp is not a foreign identity. A ``user_id``
     # stamp equal to ``subject`` itself names that principal: it is already its history by
     # ``authorize_history``'s rule, so it adopts like an unstamped row.
+    # An imported ``local`` row adopts only once claimed by its owner (``claimed_local_import``, which
+    # needs ``profile_id``), and only onto the surface that created it.
+    if row['source'] == 'local':
+        if imported_local_surface(row) is None or not claimed_local_import(
+                db, row, subject=subject, profile_id=profile_id, conn=conn):
+            raise RuntimeStoreError('not_found')
+        return
     user_id = row.get('user_id')
     if (row['source'] not in LEGACY_LOCAL_SOURCES
             or any(row.get(k) for k in ('session_key', 'chat_id', 'origin_json'))
@@ -63,7 +109,7 @@ def bind_legacy_target(db, conn, receipt):
     row = conn.execute('SELECT * FROM sessions WHERE id=?', (target,)).fetchone()
     if row is None:
         raise RuntimeStoreError('not_found')
-    validate_legacy_row(db, dict(row), subject=receipt['principal_id'])
+    validate_legacy_row(db, dict(row), subject=receipt['principal_id'], profile_id=receipt['profile_id'], conn=conn)
     from hermes_state_mutation_binding import BINDING_PREFIX
     imported = conn.execute('SELECT value FROM state_meta WHERE key=?', (BINDING_PREFIX + target,)).fetchone()
     if imported and json.loads(imported[0]) != [receipt['profile_id'], receipt['principal_id']]:

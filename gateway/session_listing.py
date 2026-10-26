@@ -1,5 +1,5 @@
 """Read-only native picker history; enumeration never adopts a transcript."""
-from hermes_state_local_migration import validate_legacy_row
+from hermes_state_local_migration import claimed_local_import, validate_legacy_row
 from hermes_state_mutation_binding import authorize_history
 from hermes_state_runtime import RuntimeStoreError
 
@@ -68,7 +68,13 @@ def stored_picker_sessions(authority, actor, *, limit, include_hidden=False):
                     break
                 continue
             try:
-                validate_legacy_row(db, tip, subject=actor.subject)
+                if tip['source'] == 'local':
+                    # An imported gateway-local chat its owner claimed: adopted on resume, or read-only
+                    # when it names no creating surface (session_history_mount).
+                    if not claimed_local_import(db, tip, subject=actor.subject, profile_id=actor.profile_id):
+                        continue
+                else:
+                    validate_legacy_row(db, tip, subject=actor.subject)
                 with db._read_ctx() as conn:
                     if not authorize_history(conn, actor, sid):
                         continue

@@ -37,6 +37,16 @@ def _authorize_import(authority, actor, ref, params):
     return tuple(item['session']['id'] for item in normalized)
 
 
+def _authorize_claim(authority, actor, ref):
+    """``claim`` binds imported history to its owner: only the redeemed same-profile native control
+    transport (legacy adoption's evidence), never a remote login. The row checks run in the write."""
+    if actor.profile_id != authority.profile_id or ref.profile_id != authority.profile_id:
+        raise RuntimeStoreError('profile_mismatch')
+    if (getattr(authority, '_native_legacy_transports', {}).get(actor.transport_id) != actor
+            or not {'session:read', 'session:create'} <= actor.capabilities):
+        raise RuntimeStoreError('permission_denied')
+
+
 def _authorize_control(authority, actor, ref, params, owner=None):
     """Control authorization; True when the session is cold history the write must claim. *owner* is
     ``_owner_ref``'s answer when the caller already resolved it (one read per mutation, not two)."""
@@ -160,6 +170,8 @@ async def _mutate_session(authority, actor, ref, params, *, commit_lock=None, ow
     imported_ids = None
     if operation == 'import':
         imported_ids = _authorize_import(authority, actor, ref, params)
+    elif operation == 'claim':
+        _authorize_claim(authority, actor, ref)
     else:
         cold_history = _authorize_control(authority, actor, ref, params, owner)
     if operation == 'branch' and 'session:create' not in actor.capabilities:
@@ -172,15 +184,18 @@ async def _mutate_session(authority, actor, ref, params, *, commit_lock=None, ow
         return await apply_chat_pick(authority, ref, owner or ref, live, params, principal_id=actor.subject)
 
     def authorize_write(conn):
-        from hermes_state_mutation_binding import authorize_history, import_history_control
+        from hermes_state_mutation_binding import authorize_history, claim_imported_history, import_history_control
         if operation == 'import':
             import_history_control(conn, actor, imported_ids)
+            return
+        if operation == 'claim':
+            claim_imported_history(authority.db, conn, actor, ref.session_id)
             return
         if not authorize_history(conn, actor, ref.session_id, claim=True):
             raise RuntimeStoreError('permission_denied')
 
     return await write_mutation(authority, ref, params, editor_servers, principal_id=actor.subject,
-                                authorize_write=authorize_write if cold_history or operation == 'import' else None,
+                                authorize_write=authorize_write if cold_history or operation in {'import', 'claim'} else None,
                                 commit_lock=commit_lock)
 
 

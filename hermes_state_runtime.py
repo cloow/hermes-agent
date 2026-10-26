@@ -500,6 +500,8 @@ def mutate_runtime_session(db, *, epoch: int, principal_id: str, session_id: str
         raise RuntimeStoreError('invalid_params')
     if operation in {'delete', 'rewind', 'reset', 'branch', 'model', 'compress'} and expected_generation is None:
         raise RuntimeStoreError('invalid_params')
+    if operation == 'claim' and _authorize_write is None:
+        raise RuntimeStoreError('permission_denied')  # the claim IS its authorized binding write
     # Snapshot caller data before waiting for the writer lock.
     payload = json.loads(_json(payload))
     key, digest = mutation_receipt_key(principal_id, session_id, request_id, operation=operation, payload=payload,

@@ -37,7 +37,7 @@ def validate_action(operation, payload):
         return
     if operation == 'compress' and _valid_compress_payload(payload):
         return
-    if operation in {'delete', 'reset'} and not payload:
+    if operation in {'delete', 'reset', 'claim'} and not payload:
         return
     if operation == 'import' and set(payload) == {'sessions'} and isinstance(payload['sessions'], list):
         return
@@ -97,7 +97,9 @@ def apply_action(db, conn, session_id, operation, payload, *, prepared=None):
         from hermes_state_mutation_branch import branch_in_transaction
         return branch_in_transaction(db, conn, session_id, payload, prepared)
     from hermes_state_mutation_reset import reset_in_transaction
-    handlers = {'delete': _delete, 'import': _import, 'rewind': _rewind, 'reset': reset_in_transaction}
+    handlers = {'delete': _delete, 'import': _import, 'rewind': _rewind, 'reset': reset_in_transaction,
+                # The claim's binding is written by its authorize_write in this transaction; the row is unchanged.
+                'claim': lambda db, conn, session_id, payload: (set(), {'claimed': True})}
     if operation in handlers:
         return handlers[operation](db, conn, session_id, payload)
     affected = set()

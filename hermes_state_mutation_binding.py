@@ -42,6 +42,30 @@ def import_history_control(conn, actor, session_ids):
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (BINDING_PREFIX + sid, binding))
 
 
+def claim_imported_history(db, conn, actor, session_id):
+    """``session.mutate claim``: bind an ALREADY-imported gateway-local row to its native owner.
+
+    ``import_history_control`` binds only ids an import creates, so a row that arrived through the
+    store's import internals (a history merge from another machine) is nobody's history. The owner
+    claims it here, in the receipt transaction, only when it is exactly that owner's unclaimed import
+    (``local_import_owned_by``). The binding is the only write; repeating an equal claim is a no-op,
+    and any other existing binding refuses.
+    """
+    row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+    if row is None:
+        raise RuntimeStoreError('not_found')
+    binding = json.dumps([actor.profile_id, actor.subject], separators=(',', ':'))
+    saved = history_binding(conn, session_id)
+    if saved is not None:
+        if saved != binding:
+            raise RuntimeStoreError('permission_denied')
+        return
+    from hermes_state_local_migration import local_import_owned_by
+    if not local_import_owned_by(db, conn, dict(row), actor.subject):
+        raise RuntimeStoreError('permission_denied')
+    conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (BINDING_PREFIX + session_id, binding))
+
+
 def authorize_history(conn, actor, session_id, *, claim=False):
     row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
     if row is None:
