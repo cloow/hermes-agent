@@ -27,6 +27,21 @@ class TestResolveCdpOverride:
     def test_keeps_full_devtools_websocket_url(self):
         assert resolve_cdp_override(WS_URL) == WS_URL
 
+    @pytest.mark.parametrize("raw, expected", [
+        ("http://10.10.1.196:9222?fingerprint=hermes-linux-p1", "http://10.10.1.196:9222/json/version?fingerprint=hermes-linux-p1"),
+        ("http://10.10.1.196:9222/?fingerprint=s", "http://10.10.1.196:9222/json/version?fingerprint=s"),
+        ("ws://10.10.1.196:9222?fingerprint=s", "http://10.10.1.196:9222/json/version?fingerprint=s"),
+        ("http://h:9222/json/version?fingerprint=s", "http://h:9222/json/version?fingerprint=s"),
+        (HTTP_URL, VERSION_URL),
+    ])
+    def test_discovery_preserves_query(self, raw, expected):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+        with patch("requests.get", return_value=response) as get:
+            assert resolve_cdp_override(raw) == WS_URL
+        assert get.call_args.args[0] == expected
+
 
     def test_redacts_secret_query_params_in_success_log(self):
         raw = "https://cdp.example/json/version?access_token=super-secret-token-123456"

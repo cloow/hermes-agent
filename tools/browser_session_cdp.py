@@ -33,12 +33,22 @@ def resolve_cdp_override(cdp_url: str) -> str:
     lowered = raw.lower()
     if "/devtools/browser/" in lowered:
         return raw
-    discovery_url = raw
-    if lowered.startswith(("ws://", "wss://")):
-        if not (raw.count(":") == 2 and raw.rstrip("/").rsplit(":", 1)[-1].isdigit() and "/" not in raw.split(":", 2)[-1]):
+    # URL-aware: a query (e.g. ``?fingerprint=<seed>`` routing on a CDP proxy) must survive onto /json/version.
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parts = urlsplit(raw)
+        _ = parts.port  # raises ValueError on a malformed port
+    except ValueError:
+        return raw
+    scheme = parts.scheme.lower()
+    path = parts.path
+    if scheme in ("ws", "wss"):
+        if parts.port is None or path.strip("/"):
             return raw
-        discovery_url = ("http://" if lowered.startswith("ws://") else "https://") + raw.split("://", 1)[1]
-    version_url = discovery_url if discovery_url.lower().endswith("/json/version") else discovery_url.rstrip("/") + "/json/version"
+        scheme = "http" if scheme == "ws" else "https"
+    if not path.lower().endswith("/json/version"):
+        path = path.rstrip("/") + "/json/version"
+    version_url = urlunsplit((scheme, parts.netloc, path, parts.query, ""))
     try:
         import requests  # lazy: shared module object, so test patches still apply
         response = requests.get(version_url, timeout=10, **loopback_request_kwargs(version_url))
