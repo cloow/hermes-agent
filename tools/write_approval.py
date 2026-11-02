@@ -12,14 +12,17 @@ interactive CLI only) or **stages** the write under
 from __future__ import annotations
 
 import difflib
+import errno
 import json
 import logging
+import math
 import os
 import re
 import stat
+import threading
 import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -68,6 +71,12 @@ def _normalize_enabled(value: Any) -> bool:
 _PENDING_ID_RE = re.compile(r"[0-9a-f]{8}")
 # ``<id>.json`` moves here while an approval applies it; a leftover one needs a human (see claim_pending).
 _CLAIM_SUFFIX = ".applying.json"
+_STORE_LOCK = ".store.lock"
+_store_lock_holder = threading.local()
+
+
+class PendingStoreError(OSError):
+    """The pending store cannot be used safely (redirected out of the Hermes home, or locked too long)."""
 
 
 def is_pending_id(value: Any) -> bool:
@@ -75,9 +84,15 @@ def is_pending_id(value: Any) -> bool:
 
 
 def _pending_dir(subsystem: str) -> Path:
+    """``<HERMES_HOME>/pending/<subsystem>``. Refuses a store that a symlink or junction under the Hermes
+    home redirects elsewhere: reads, claims and deletes would then act on files outside it."""
     if subsystem not in _SUBSYSTEMS:
         raise ValueError(f"unknown write-approval subsystem {subsystem!r}")
-    return get_hermes_home() / "pending" / subsystem
+    home = get_hermes_home()
+    d = home / "pending" / subsystem
+    if any(p.is_symlink() for p in (d.parent, d)) or d.resolve() != home.resolve() / "pending" / subsystem:
+        raise PendingStoreError(f"the {subsystem} pending store {d} is redirected by a link; refusing to use it")
+    return d
 
 
 def _pending_path(subsystem: str, pending_id: str) -> Path:
@@ -90,9 +105,31 @@ def _claim_path(subsystem: str, pending_id: str) -> Path:
     return _pending_path(subsystem, pending_id).with_name(f"{pending_id}{_CLAIM_SUFFIX}")
 
 
+def _claimed_ids(d: Path) -> set[str]:
+    return {i for i in (p.name[:-len(_CLAIM_SUFFIX)] for p in d.glob(f"*{_CLAIM_SUFFIX}")) if is_pending_id(i)}
+
+
 def _pending_files(subsystem: str) -> list:
+    """Files named like a pending record; an id that also has a claim is not pending (it is listed for
+    reconciliation instead, and ``reject all`` must not delete it under the person reconciling it)."""
     d = _pending_dir(subsystem)
-    return [p for p in d.glob("*.json") if is_pending_id(p.stem)] if d.exists() else []
+    if not d.exists():
+        return []
+    claimed = _claimed_ids(d)
+    return [p for p in d.glob("*.json") if is_pending_id(p.stem) and p.stem not in claimed]
+
+
+@contextmanager
+def _store_lock(subsystem: str):
+    """Cross-process lock serializing claim, restore and discard in one subsystem's store, so a reject
+    and an approve of one id can never both succeed."""
+    from hermes_cli.auth import _file_lock
+    d = _pending_dir(subsystem)
+    try:
+        with _file_lock(d / _STORE_LOCK, _store_lock_holder, 15.0, f"Timed out waiting for the {subsystem} pending store"):
+            yield
+    except TimeoutError as e:
+        raise PendingStoreError(str(e)) from e
 
 
 def _read_record(path: Path, subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
@@ -114,7 +151,7 @@ def _read_record(path: Path, subsystem: str, pending_id: str) -> Optional[dict[s
     created = record.get("created_at") if isinstance(record, dict) else None
     if (not isinstance(record, dict) or record.get("id") != pending_id or record.get("subsystem") != subsystem
             or not isinstance(record.get("payload"), dict)
-            or isinstance(created, bool) or not isinstance(created, (int, float)) or created != created):
+            or isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created)):
         return None
     return record
 
@@ -158,80 +195,132 @@ def list_unapprovable(subsystem: str) -> list[tuple[str, str]]:
     d = _pending_dir(subsystem)
     if not d.exists():
         return []
-    out = [(p.name[:-len(_CLAIM_SUFFIX)], "claimed") for p in d.glob(f"*{_CLAIM_SUFFIX}")
-           if is_pending_id(p.name[:-len(_CLAIM_SUFFIX)])]
+    out = [(i, "claimed") for i in _claimed_ids(d)]
     out += [(p.stem, "invalid") for p in _pending_files(subsystem) if _read_record(p, subsystem, p.stem) is None]
     return sorted(out)
 
 
+def is_claimed(subsystem: str, pending_id: str) -> bool:
+    return is_pending_id(pending_id) and os.path.lexists(_claim_path(subsystem, pending_id))
+
+
 def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
-    """Return a single valid pending record by id, or None."""
-    if not is_pending_id(pending_id):
+    """Return a single valid pending record by id, or None (also while it is claimed)."""
+    if not is_pending_id(pending_id) or is_claimed(subsystem, pending_id):
         return None
     return _read_record(_pending_path(subsystem, pending_id), subsystem, pending_id)
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record (valid or not, so a broken one can be rejected; a symlink is
-    removed, never followed). Returns True if it existed. A claimed record is not pending."""
+    removed, never followed). Returns True if it existed. A claimed id is not pending: its record is
+    left for whoever reconciles the claim."""
     if not is_pending_id(pending_id):
         return False
     try:
-        _pending_path(subsystem, pending_id).unlink()
-        return True
+        with _store_lock(subsystem):
+            if is_claimed(subsystem, pending_id):
+                return False
+            _pending_path(subsystem, pending_id).unlink()
+            return True
     except FileNotFoundError:
         return False
-    except OSError as e:  # pragma: no cover
+    except OSError as e:
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
 
 
 def pending_count(subsystem: str) -> int:
-    """Cheap count of pending records (for notification badges)."""
-    d = _pending_dir(subsystem)
-    if not d.exists():
-        return 0
+    """Cheap count of approvable-looking pending records (for notification badges): files named by a
+    minted id that no claim holds. Not parsed, so an invalid record still counts until rejected."""
     with suppress(Exception):
-        return sum(1 for _ in d.glob("*.json"))
+        return len(_pending_files(subsystem))
     return 0
+
+
+def has_review_items(subsystem: str) -> bool:
+    """Whether ``/<subsystem>`` review has anything to show: pending records, claims to reconcile, or
+    invalid records. True for a store it refuses, so the refusal is shown rather than hidden."""
+    try:
+        return pending_count(subsystem) > 0 or bool(list_unapprovable(subsystem))
+    except PendingStoreError:
+        return True
 
 
 # --- Approval claim ---
 # One pending record is one transaction. Approving it first moves ``<id>.json`` to
-# ``<id>.applying.json`` in the same directory without ever replacing an existing file, so of two
-# approvers (two chat surfaces, a double-sent command) exactly one applies it. Only a confirmed
-# no-effect failure puts the record back; a crash, an uncertain rollback or a failed cleanup leaves
-# the claim for a person to reconcile. Not exactly-once side effects: a claim never replays.
+# ``<id>.applying.json`` in the same directory, under the store lock and without ever replacing a file,
+# so of two approvers (two chat surfaces, a double-sent command) exactly one applies it, and an approve
+# and a reject of one id never both succeed. The claim is bound to the record that was checked: a record
+# changed in between goes back for fresh review. Only a confirmed no-effect failure puts the record back;
+# a crash, an uncertain outcome or a failed cleanup leaves the claim for a person to reconcile.
+# Not exactly-once side effects: a claim is never replayed.
 
-CLAIMED, MISSING, BUSY, INVALID, STORE_ERROR = "claimed", "missing", "busy", "invalid", "store_error"
+CLAIMED, MISSING, BUSY, INVALID, CHANGED, STORE_ERROR = (
+    "claimed", "missing", "busy", "invalid", "changed", "store_error")
 
 
 def _move_no_replace(src: Path, dst: Path) -> None:
-    """Atomically give ``src`` the name ``dst``; FileExistsError when ``dst`` exists (a hard link
-    is created exclusively, unlike a rename, which would silently replace it)."""
-    os.link(src, dst)
+    """Give ``src`` the name ``dst`` (caller holds the store lock); FileExistsError when ``dst`` exists,
+    FileNotFoundError when ``src`` is gone. A hard link is created exclusively and does not follow a
+    symlink, where supported; a store without hard links falls back to a rename, which the lock makes
+    no-replace for every store writer (Windows' rename never replaces)."""
+    try:
+        if os.link in os.supports_follow_symlinks:
+            os.link(src, dst, follow_symlinks=False)
+        else:
+            os.link(src, dst)
+    except (FileExistsError, FileNotFoundError):
+        raise
+    except OSError:  # no hard links here (FAT/exFAT, some network shares)
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "already exists", str(dst)) from None
+        os.rename(src, dst)
+        return
     try:
         os.unlink(src)
-    except FileNotFoundError:  # a concurrent reject already dropped the old name
-        pass
     except OSError:  # never leave one record under both names
         with suppress(OSError):
             os.unlink(dst)
         raise
 
 
-def claim_pending(subsystem: str, pending_id: str) -> tuple[str, Optional[dict[str, Any]]]:
-    """Claim a pending record for applying: ``(CLAIMED, record)``, or ``(MISSING|BUSY|INVALID|
-    STORE_ERROR, None)`` with nothing changed. Finish with :func:`release_claim` or :func:`restore_claim`."""
-    src, claim = _pending_path(subsystem, pending_id), _claim_path(subsystem, pending_id)
-    if claim.is_symlink() or claim.exists():
-        return BUSY, None
-    if src.is_symlink() or not src.exists():
-        return (INVALID if src.is_symlink() else MISSING), None
-    if _read_record(src, subsystem, pending_id) is None:
-        return INVALID, None
+def _identity(path: Path) -> Optional[tuple[int, int]]:
     try:
-        _move_no_replace(src, claim)
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
+
+
+def claim_pending(subsystem: str, pending_id: str, expected: Optional[dict[str, Any]] = None
+                  ) -> tuple[str, Optional[dict[str, Any]]]:
+    """Claim a pending record for applying: ``(CLAIMED, record)``, or a refusal with the store left as it
+    was: MISSING, BUSY (claimed already), INVALID, CHANGED (not the record that was checked, or not
+    ``expected``: it stays pending for fresh review) or STORE_ERROR. Finish with :func:`release_claim`
+    or :func:`restore_claim`."""
+    src, claim = _pending_path(subsystem, pending_id), _claim_path(subsystem, pending_id)
+    try:
+        with _store_lock(subsystem):
+            if os.path.lexists(claim):
+                return BUSY, None
+            if not os.path.lexists(src):
+                return MISSING, None
+            checked, before = _read_record(src, subsystem, pending_id), _identity(src)
+            if checked is None:
+                return INVALID, None
+            if expected is not None and checked != expected:
+                return CHANGED, None
+            _move_no_replace(src, claim)
+            record = _read_record(claim, subsystem, pending_id)
+            if record == checked and _identity(claim) == before:
+                return CLAIMED, record
+            try:  # changed between the check and the claim: hand it back for fresh review
+                _move_no_replace(claim, src)
+            except OSError:
+                logger.warning("write_approval: could not hand back %s/%s", subsystem, pending_id, exc_info=True)
+                return BUSY, None
+            return CHANGED, None
     except FileExistsError:
         return BUSY, None
     except FileNotFoundError:
@@ -239,11 +328,6 @@ def claim_pending(subsystem: str, pending_id: str) -> tuple[str, Optional[dict[s
     except OSError:
         logger.warning("write_approval: could not claim %s/%s", subsystem, pending_id, exc_info=True)
         return STORE_ERROR, None
-    record = _read_record(claim, subsystem, pending_id)
-    if record is None:  # changed between the check and the claim: hand it back for fresh review
-        restore_claim(subsystem, pending_id)
-        return INVALID, None
-    return CLAIMED, record
 
 
 def release_claim(subsystem: str, pending_id: str) -> bool:
@@ -261,7 +345,8 @@ def restore_claim(subsystem: str, pending_id: str) -> bool:
     """Put a claimed record back in the queue after a confirmed no-effect failure. Never replaces a
     record that took its name meanwhile: False keeps the claim for reconciliation."""
     try:
-        _move_no_replace(_claim_path(subsystem, pending_id), _pending_path(subsystem, pending_id))
+        with _store_lock(subsystem):
+            _move_no_replace(_claim_path(subsystem, pending_id), _pending_path(subsystem, pending_id))
         return True
     except OSError:
         logger.warning("write_approval: could not restore the claim on %s/%s", subsystem, pending_id, exc_info=True)
@@ -322,7 +407,7 @@ def _staged(subsystem: str) -> GateDecision:
     if _slash_review_surface():
         where = f"review with {command}"
     else:
-        where = (f"pending records live in {_pending_dir(subsystem)} "
+        where = (f"pending records live in {get_hermes_home() / 'pending' / subsystem} "
                  f"(review from an interactive CLI session with {command})")
     return GateDecision(stage=True, message=(f"Staged for approval ({subsystem}.write_approval is on). "
                                              f"Not yet saved — {where}."))

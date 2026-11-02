@@ -60,6 +60,13 @@ def handle_pending_subcommand(
     or None when the args are not a write-approval subcommand so the caller falls through to its
     other handling (e.g. /skills search).
     """
+    try:
+        return _dispatch(subsystem, args, memory_store, set_mode_fn)
+    except wa.PendingStoreError as e:
+        return f"Refusing to use the {subsystem} pending store: {e}"
+
+
+def _dispatch(subsystem: str, args: list[str], memory_store, set_mode_fn) -> Optional[str]:
     if not args:
         return f"{_fmt_state(subsystem)}\n\n" + _fmt_pending_list(subsystem)
     sub, rest = args[0].lower(), args[1:]
@@ -112,7 +119,7 @@ def parse_selection(args: list[str]) -> str | list[str]:
 _OUTCOMES = {
     "approved": ("approved", True), "cleanup_failed": ("applied with cleanup failure", True),
     "missing": ("not pending", False), "busy": ("busy", False), "invalid": ("invalid", False),
-    "store_error": ("store error", False), "failed": ("failed", False), "conflict": ("conflicting", False), "uncertain": ("uncertain", False),
+    "store_error": ("store error", False), "changed": ("changed", False), "failed": ("failed", False), "conflict": ("conflicting", False), "uncertain": ("uncertain", False),
     "interrupted": ("interrupted", False), "skipped": ("not attempted", False)}
 
 
@@ -122,24 +129,34 @@ def _approve(subsystem: str, rest: list[str], memory_store) -> str:
     except ValueError as e:
         return f"{_approve_usage(subsystem)}\n{e}. Nothing was applied."
     if selection == "all":
-        ids = [r["id"] for r in wa.list_pending(subsystem)]  # the snapshot; later arrivals wait
-        if not ids:
+        snapshot = {r["id"]: r for r in wa.list_pending(subsystem)}  # later arrivals wait for the next run
+        if not snapshot:
             return f"No pending {subsystem} writes."
+        ids = list(snapshot)
     else:
-        ids = selection
+        snapshot, ids = {}, selection
 
     outcomes: list[tuple[str, str, str]] = []  # (id, outcome, line)
     overwritten, patched, removed = [], [], []
-    for i, pid in enumerate(ids):
-        outcome, line, result = _approve_one(subsystem, pid, memory_store)
-        outcomes.append((pid, outcome, line))
-        if _OUTCOMES[outcome][1]:
-            overwritten.extend(f"  {pid}: {text}" for text in _changed_entries(result, "replaced"))
-            patched.extend(f"  {pid}: {text}" for text in _changed_entries(result, "patched"))
-            removed.extend(f"  {pid}: {text}" for text in _changed_entries(result, "removed"))
-        if outcome == "interrupted":  # stop before the next record; finished ones stay finished
-            outcomes.extend((rest_id, "skipped", f"{rest_id}: not attempted (stopped)") for rest_id in ids[i + 1:])
-            break
+    current = None
+    try:
+        for pid in ids:
+            current = pid
+            outcome, line, result = _approve_one(subsystem, pid, memory_store, snapshot.get(pid))
+            outcomes.append((pid, outcome, line))
+            current = None
+            if _OUTCOMES[outcome][1]:
+                overwritten.extend(f"  {pid}: {text}" for text in _changed_entries(result, "replaced"))
+                patched.extend(f"  {pid}: {text}" for text in _changed_entries(result, "patched"))
+                removed.extend(f"  {pid}: {text}" for text in _changed_entries(result, "removed"))
+            if outcome == "interrupted":
+                break
+    except KeyboardInterrupt:  # anywhere in the loop: report what finished, stop before the next record
+        if current is not None:
+            outcomes.append((current, "interrupted", f"{current}: interrupted — see /{subsystem} pending: it is "
+                                                     f"still pending or claimed for reconciliation"))
+    done = {pid for pid, _, _ in outcomes}
+    outcomes.extend((pid, "skipped", f"{pid}: not attempted (stopped)") for pid in ids if pid not in done)
 
     applied = sum(1 for _, o, _ in outcomes if _OUTCOMES[o][1])
     out = [f"Approved {applied} {subsystem} write(s)."]
@@ -162,16 +179,18 @@ def _approve(subsystem: str, rest: list[str], memory_store) -> str:
     return "\n".join(out)
 
 
-def _approve_one(subsystem: str, pid: str, memory_store) -> tuple[str, str, dict]:
+def _approve_one(subsystem: str, pid: str, memory_store, expected=None) -> tuple[str, str, dict]:
     """Claim, apply and settle one record: ``(outcome, line, applier result)``. Each record is its
     own transaction; only a confirmed no-effect failure puts it back in the queue."""
-    state, rec = wa.claim_pending(subsystem, pid)
+    state, rec = wa.claim_pending(subsystem, pid, expected)
     if state != wa.CLAIMED:
         outcome, line = {
             wa.MISSING: ("missing", f"{pid}: not pending"),
             wa.BUSY: ("busy", f"{pid}: busy — being applied elsewhere or interrupted earlier; "
                               f"see /{subsystem} pending"),
             wa.INVALID: ("invalid", f"{pid}: invalid record, not applied — inspect it or /{subsystem} reject {pid}"),
+            wa.CHANGED: ("changed", f"{pid}: changed since it was checked; not applied, left pending for fresh "
+                                    f"review (/{subsystem} pending)"),
             wa.STORE_ERROR: ("store_error", f"{pid}: could not be claimed (pending store error); left pending"),
         }[state]
         return outcome, line, {}
@@ -211,9 +230,10 @@ def _matched_entries(payload) -> list[str]:
 
 
 def _apply_one(subsystem: str, rec, memory_store):
-    """``(ok, error, result, certain)`` — *result* is the applier's full payload. A failure the
-    applier reported (after its own rollback) left nothing behind; an exception, an unreadable
-    result or a failed rollback did not settle that (``certain`` False)."""
+    """``(ok, error, result, certain)`` — *result* is the applier's full payload. Applied only on an
+    explicit ``success: True``. A failure is confirmed to have left nothing behind only when the applier
+    says so explicitly (``success: False`` with an error, after its own rollback); an exception, a
+    malformed or missing outcome, or a failed rollback did not settle that (``certain`` False)."""
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
@@ -228,7 +248,12 @@ def _apply_one(subsystem: str, rec, memory_store):
         return False, str(e), {}, False
     if not isinstance(result, dict):
         return False, "unreadable applier result", {}, False
-    return bool(result.get("success")), result.get("error", ""), result, not result.get("rollback_failed")
+    if result.get("success") is True:
+        return True, "", result, True
+    error = result.get("error")
+    if result.get("success") is False and isinstance(error, str) and error and not result.get("rollback_failed"):
+        return False, error, result, True
+    return False, (error if isinstance(error, str) and error else "no clear outcome from the applier"), {}, False
 
 
 def _single_target(subsystem: str, verb: str, rest: list[str], *, allow_all: bool):
@@ -251,6 +276,9 @@ def _reject(subsystem: str, rest: list[str]) -> str:
     if target == "all":
         n = sum(1 for rec in wa.list_pending(subsystem) if wa.discard_pending(subsystem, rec["id"]))
         return f"Rejected {n} pending {subsystem} write(s)."
+    if wa.is_claimed(subsystem, target):
+        return (f"Pending {subsystem} write '{target}' is being applied or awaits reconciliation "
+                f"(see /{subsystem} pending); not rejected.")
     if wa.discard_pending(subsystem, target):
         return f"Rejected pending {subsystem} write '{target}'."
     return f"No pending {subsystem} write with id '{target}'."

@@ -990,7 +990,7 @@ def _cmd_skills(rid, params, session, name, arg):
     # The gate being off must not strand writes that are already staged (gateway parity): still
     # answer when a pile exists, and point at the toggle when there is nothing to review.
     if (sub[0].lower() not in {"approval", "mode"} and not wa.write_approval_enabled(wa.SKILLS)
-            and wa.pending_count(wa.SKILLS) == 0):
+            and not wa.has_review_items(wa.SKILLS)):
         return _exec_out(rid, "Skill write approval is off (skills.write_approval). "
                               "Enable it with /skills approval on, then review staged writes "
                               "with /skills pending.")

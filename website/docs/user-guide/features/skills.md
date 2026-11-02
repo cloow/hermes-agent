@@ -701,7 +701,8 @@ own result (approved, not pending, busy, failed, ...): a failed write stays
 pending for review, and an unknown id never stops the others. `reject` and
 `diff` take exactly one id. An approval that was interrupted or could not
 finish leaves `<id>.applying.json` behind; `/skills pending` lists it as
-needing reconciliation and `approve` never retries it.
+needing reconciliation; `approve` never retries it and `reject` leaves it alone. A record that
+changed after it was checked is not applied: it stays pending for a fresh look.
 
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or

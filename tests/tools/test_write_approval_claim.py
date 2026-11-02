@@ -33,6 +33,11 @@ def _store(home, subsystem=wa.SKILLS) -> Path:
     return home / "pending" / subsystem
 
 
+def _entries(home, subsystem=wa.SKILLS) -> list[str]:
+    """Record and claim files in the store (its lock file is bookkeeping)."""
+    return sorted(p.name for p in _store(home, subsystem).iterdir() if p.name != ".store.lock")
+
+
 def _stage_skill(name: str) -> str:
     return wa.stage_write(wa.SKILLS, {"action": "create", "name": name, "content": _SKILL.format(name=name)},
                           summary=f"create {name}", origin="foreground")["id"]
@@ -125,7 +130,7 @@ def test_second_approver_of_one_record_reports_busy_and_does_not_replay(home, mo
     assert calls == ["raced"], "the record must be applied exactly once"
     assert f"{pid}: busy" in inner["out"] and "Approved 0" in inner["out"], inner
     assert f"{pid}: approved" in out
-    assert not list(_store(home).iterdir()), "the claim is removed after a clean apply"
+    assert not _entries(home), "the claim is removed after a clean apply"
 
 
 def test_reject_does_not_remove_a_claimed_record(home, monkeypatch):
@@ -139,7 +144,7 @@ def test_reject_does_not_remove_a_claimed_record(home, monkeypatch):
 
     _patch_applier(monkeypatch, applier)
     out = _skills(f"approve {pid}")
-    assert f"{pid}: approved" in out and "No pending skills write" in inner["out"], (out, inner)
+    assert f"{pid}: approved" in out and "not rejected" in inner["out"], (out, inner)
 
 
 def test_confirmed_failure_restores_the_record(home, monkeypatch):
@@ -147,7 +152,7 @@ def test_confirmed_failure_restores_the_record(home, monkeypatch):
     _patch_applier(monkeypatch, lambda payload: json.dumps({"success": False, "error": "nope"}))
     out = _skills(f"approve {pid}")
     assert f"{pid}: failed (nope); left pending" in out, out
-    assert [p.name for p in _store(home).iterdir()] == [f"{pid}.json"]
+    assert _entries(home) == [f"{pid}.json"]
     assert [r["id"] for r in wa.list_pending(wa.SKILLS)] == [pid]
 
 
@@ -243,18 +248,40 @@ def test_a_fifo_named_like_a_record_never_blocks_review(home):
     assert f"{fifo_id}: invalid record" in out and f"{keep}: approved" in out, out
 
 
-def test_a_store_that_refuses_the_claim_leaves_the_record_pending(home, monkeypatch):
+def test_a_store_without_hard_links_still_claims_once(home, monkeypatch):
     import os
+    import tools.skill_manager_tool as smt
     pid = _stage_skill("no-links")
+    real, calls = smt.apply_skill_pending, []
 
     def refuse(src, dst, *a, **k):
         raise PermissionError("hard links not permitted here")
 
+    def applier(payload):
+        calls.append(payload["name"])
+        assert f"{pid}: busy" in _skills(f"approve {pid}")
+        return real(payload)
+
     monkeypatch.setattr(os, "link", refuse)
+    _patch_applier(monkeypatch, applier)
+    out = _skills(f"approve {pid}")
+    assert f"{pid}: approved" in out and calls == ["no-links"], out
+    assert not _entries(home)
+
+
+def test_a_store_that_refuses_the_claim_leaves_the_record_pending(home, monkeypatch):
+    import os
+    pid = _stage_skill("no-moves")
+
+    def refuse(*a, **k):
+        raise PermissionError("store is read-only")
+
+    monkeypatch.setattr(os, "link", refuse)
+    monkeypatch.setattr(os, "rename", refuse)
     _patch_applier(monkeypatch, lambda payload: pytest.fail("an unclaimed record must not be applied"))
     out = _skills(f"approve {pid}")
     assert f"{pid}: could not be claimed" in out and "Approved 0" in out, out
-    assert [p.name for p in _store(home).iterdir()] == [f"{pid}.json"]
+    assert _entries(home) == [f"{pid}.json"]
 
 
 def test_a_failed_unlink_after_the_claim_link_leaves_one_name(home, monkeypatch):
@@ -271,4 +298,4 @@ def test_a_failed_unlink_after_the_claim_link_leaves_one_name(home, monkeypatch)
     _patch_applier(monkeypatch, lambda payload: pytest.fail("an unclaimed record must not be applied"))
     out = _skills(f"approve {pid}")
     assert f"{pid}: could not be claimed" in out, out
-    assert [p.name for p in _store(home).iterdir()] == [f"{pid}.json"]
+    assert _entries(home) == [f"{pid}.json"]

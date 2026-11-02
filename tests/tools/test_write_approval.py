@@ -39,10 +39,12 @@ def test_list_pending_skips_non_dict_record(hermes_home):
     wa.stage_write("memory", {"action": "add", "target": "user", "content": "ok"},
                    summary="ok", origin="foreground")
     pending_dir = wa._pending_dir("memory")
-    (pending_dir / "bad.json").write_text('"not a record"', encoding="utf-8")
+    bad = "0badc0de"  # a minted-shape name, so the file is parsed rather than skipped by its name
+    (pending_dir / f"{bad}.json").write_text('"not a record"', encoding="utf-8")
     records = wa.list_pending("memory")
     assert len(records) == 1 and records[0]["payload"]["content"] == "ok"
-    assert wa.get_pending("memory", "bad") is None
+    assert wa.get_pending("memory", bad) is None
+    assert (bad, "invalid") in wa.list_unapprovable("memory")
 
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa
