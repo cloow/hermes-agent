@@ -16,10 +16,12 @@ The feature is not implemented. Task A is the first bounded implementation assig
 2. Verify this checkout is on `docs/desktop-command-actions-plan` and has no unexpected changes.
 3. Verify the fork's published branch SHA matches the local planning commit.
 4. Preserve the pinned upstream code baseline and all existing worktrees. Do not update the installed app.
-5. Load the Claude Code operating skill and check current official cloud-session documentation.
-6. Verify the Claude account and its access to `cloow/hermes-agent` before launching anything.
-7. Start one ordinary cloud session on this fork and planning branch, using the prompt in task-a.md.
-8. Report the session URL and selected repository/branch. Stop if authentication or repository access is unavailable.
+5. Load the Claude Code operating skill and check current official cloud-session documentation. Follow cli-launch.md; CLI only, no Chrome automation.
+6. Check `claude --version`, `claude --help`, and `claude auth status`. Require subscription authentication for the account holding the cloud credits, not Console/API billing. Stop for secure CLI sign-in when missing.
+7. If local planning commits differ from the published SHA, stop for approval to publish the documentation. Never launch the old plan silently, push without approval, or treat local-only changes as uploaded.
+8. Create the independent fork-only clone specified in cli-launch.md. Verify its sole remote, branch, clean status, baseline ancestry, and SHA against the published planning branch. Preserve existing worktrees/remotes.
+9. Start exactly one ordinary cloud session using cli-launch.md's guarded `--ref docs/desktop-command-actions-plan --forward-home-settings=false --cloud` command and the literal prompt extracted from task-a.md. Run setup and dispatch in the same tracked shell. Do not use local print-mode implementation, Remote Control, Projects, Routines, or additional workers.
+10. Capture the returned session URL. A successful detached creation may print its URL and exit 0: do not relaunch it. If account-enabled CLI attachment is available, read back the same session to verify repository/base and accepted Task A prompt. If attachment is account-gated, report confirmed creation but unverified worker/provisioning state and ask the user to inspect that exact URL manually. Print-mode follow-up messages are not status probes. Stop on uncertain dispatch status; do not launch a replacement. Report launch evidence separately from implementation/review status.
 
 The user pasting the launch prompt authorizes one Task A cloud session. It does not authorize subsequent tasks, code publication, PR creation, merging, or deployment.
 
@@ -27,15 +29,15 @@ The user pasting the launch prompt authorizes one Task A cloud session. It does 
 
 The Studio folder has a PM-built `.venv`, root npm dependencies, and the Electron binary prepared. The unchanged code's write-approval suite passed 24 tests.
 
-The shared worktree remotes name the upstream repository `origin` and the user's fork `fork`. A bare cloud CLI launch can choose the wrong repository. Prefer the web repository and branch selectors unless the CLI's actual target is verified.
+The shared worktree remotes name the upstream repository `origin` and the user's fork `fork`. Do not rename or rewrite these shared remotes. A separate clone with one fork remote makes CLI targeting unambiguous.
 
-During setup, the accessible local browser reached Claude's sign-in screen. No Claude login was available in the browser vault. The Claude CLI was not installed. GitHub CLI authentication worked, but it could not list GitHub App installations with its token.
+Claude Code 2.1.316 is installed on Linux via `npm install -g @anthropic-ai/claude-code` in the existing user prefix. Version/help checks passed. CLI authentication reported `loggedIn: false`; secure subscription login remains a prerequisite. No cloud session has been launched. Recheck these facts in the new session.
 
-Therefore Claude account authorization is **not verified**. Do not infer it from the successful Git push. The user's already signed-in browser can use claude.ai/code directly.
+The user's main Chrome on the MacBook is signed in to Claude and showed access to the fork. That is not Linux CLI authentication. Browser automation was stopped at the user's request after repeated debugging permission prompts. Do not reopen that route or copy browser credentials.
 
-Do not install extra tooling solely to work around a sign-in requirement. Never request passwords or login codes in chat. Use supported secure sign-in tools or ask the user to sign in.
+Never request passwords, tokens, or login codes in chat. Use `claude auth login` through its supported secure user flow when needed; do not use `--console` or API-key billing as a substitute. Do not install additional tooling to evade authentication.
 
-Use ordinary cloud sessions to consume the promotional credit. Claude Projects and Routines are excluded from that promotion. Check the current balance and expiry before dispatch; do not assume the old screenshot is still current.
+The requested funding source is existing cloud credit. Check current balance, expiry, and ordinary-session eligibility before dispatch; do not assume the old screenshot is current or that `--cloud` guarantees promotional billing. If the CLI cannot expose this information, ask for user confirmation from their usage page without automating Chrome. Do not enable paid overage, buy credits, or switch billing sources. Projects and Routines remain excluded by the user's request.
 
 ## Review loop
 

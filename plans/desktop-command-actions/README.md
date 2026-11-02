@@ -17,24 +17,18 @@ Select the Studio folder labelled **hermes: Desktop command actions** and start 
 Paste this:
 
 ```text
-Read plans/desktop-command-actions/README.md and session-prompt.md in that folder. Continue this handoff: verify the published planning branch, then prepare and launch only Task A as an ordinary Claude Code cloud session using my existing cloud credits. Do not implement the task locally or use Claude Projects/Routines. Preserve the plan's review gates, report the cloud session URL, and stop for sign-in if my Claude account is unavailable.
+Read plans/desktop-command-actions/README.md, session-prompt.md, and cli-launch.md. Continue the CLI-only handoff for Task A. Verify Claude CLI subscription authentication, cloud-credit eligibility, and the published planning SHA before dispatch. If the revised plan is not published, stop for approval to push these documentation commits. Launch exactly one ordinary Claude Code cloud session from a separate clone of cloow/hermes-agent on docs/desktop-command-actions-plan. Do not implement locally, automate Chrome, use Projects/Routines, or start other tasks. Preserve all review gates and report the verified cloud session URL. Stop on missing authentication or ambiguous launch status; never blindly retry.
 ```
 
 The detailed instructions are in [session-prompt.md](session-prompt.md).
 
-## Start directly in Claude Code on the web
+## CLI-only launch
 
-1. Open [claude.ai/code](https://claude.ai/code) with the account that holds the cloud credit.
-2. Select **cloow/hermes-agent**, not the upstream repository.
-3. Select **docs/desktop-command-actions-plan**.
-4. Start an ordinary cloud session, not a Claude Project or Routine.
-5. Paste the prompt from [task-a.md](task-a.md).
+Follow [cli-launch.md](cli-launch.md). Claude Code 2.1.316 is installed on the Linux coordinator in the existing npm global prefix. `claude --version` and `claude --help` passed; `--cloud` is available. `claude auth status` reported **loggedIn: false**. Main Chrome's Claude login does not authenticate this CLI.
 
-The worktree's shared Git remote `origin` points upstream. Do not assume a bare `claude --cloud` command selects this fork.
-Use the web repository and branch selectors unless the CLI's effective target is independently verified.
+Do not run a bare cloud launch from this linked worktree: its shared `origin` points upstream. The runbook uses a fresh, independent clone whose only remote is the fork, and checks branch and SHA before launch. Do not change shared remotes.
 
-GitHub access and Claude authorization are separate. Publishing a branch does not connect the Claude GitHub App.
-If this fork is missing from the repository selector, grant the Claude GitHub App access to this repository through Claude's onboarding.
+This preparation pass launches nothing. The revised handoff must be reviewed and published with approval before the next session dispatches Task A. No browser automation or repeated Chrome debugging prompts.
 
 ## Documents
 
@@ -44,6 +38,7 @@ If this fork is missing from the repository selector, grant the Claude GitHub Ap
 | [technical-plan.md](technical-plan.md) | Canonical contracts and acceptance criteria |
 | [task-a.md](task-a.md) | First bounded cloud implementation prompt |
 | [session-prompt.md](session-prompt.md) | Local Hermes orchestration handoff |
+| [cli-launch.md](cli-launch.md) | CLI authentication, fork isolation, and one-session dispatch |
 | [review-resolution.md](review-resolution.md) | Fable findings and corrections |
 | [upstream.md](upstream.md) | Public upstream references and overlap checks |
 
@@ -70,8 +65,8 @@ A cloud worker starts in a fresh VM. Bootstrap there using `CONTRIBUTING.md`; th
 
 ## Permissions
 
-The planning branch is published to the fork. No upstream PR or feature PR is opened.
-The setup session does not start a cloud run. Pasting the handoff prompt starts the next task.
+The original planning commit is published to the fork. Revised local CLI-handoff commits are not published until separately approved. No upstream PR or feature PR is opened.
+The preparation session does not start a cloud run. The next session checks publication and authentication before starting the authorized Task A run.
 
 The implementation worker can edit, test, and commit in its assigned cloud branch.
 It must not merge, deploy, push code, open a PR, change live profiles, or launch additional workers without a separate instruction.

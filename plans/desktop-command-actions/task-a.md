@@ -1,6 +1,6 @@
 # Task A — batch approval of selected pending skills
 
-Paste this prompt into an ordinary Claude Code cloud session after selecting `cloow/hermes-agent` and branch `docs/desktop-command-actions-plan`:
+Pass only the fenced prompt below as the argument to `claude --cloud`, following cli-launch.md from the verified fork-only clone on `docs/desktop-command-actions-plan`. This file is not an instruction to implement locally. The implementation contract is unchanged by the CLI transport.
 
 ```text
 Implement Task A only: batch approval of selected pending skill writes.

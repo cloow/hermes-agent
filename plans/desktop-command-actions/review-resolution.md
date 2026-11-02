@@ -37,3 +37,16 @@ Older research statements about missing gateway terminal ownership were supersed
 ## Evidence limits
 
 The plan gate used source inspection, not runtime tests. A separate setup smoke test later passed the unchanged baseline write-approval suite. Neither result proves the requested feature works.
+
+## CLI handoff review
+
+Argon (`gemini-4-argon-high`, runtime-confirmed) reviewed the CLI-only handoff and returned **CHANGES REQUIRED**. The coordinator applied these corrections; no second Argon approval or cloud execution is claimed:
+
+| Finding | Correction |
+|---|---|
+| Interactive cloud attachment is account-gated | Distinguish detached creation from attached operation. Capture the URL without retrying creation; request manual inspection when CLI readback is unavailable. Print-mode follow-ups are not status reads. |
+| Basic cloud launch can silently upload a local bundle | Require explicit `--ref` and `--forward-home-settings=false` before `--cloud`; fail closed rather than omit the guards. |
+| A new PTY/tmux shell loses setup cwd and variables | Require all setup, extraction, and dispatch in one tracked shell, with target/SHA checks immediately before dispatch. Never transmit the multiline prompt via keystrokes. |
+| Publication target and commit state were insufficiently explicit | Commit reviewed docs locally, require a clean docs-only diff, verify the fork push URL, and specify its exact branch refspec. Publishing still needs separate approval. |
+
+Verification covers CLI version/help/auth status, installed guard availability, Bash syntax, literal worker-prompt preservation, local documentation links, and repository checks. It does not establish CLI authentication, credit balance, successful cloud provisioning, or feature correctness. No local feature implementation or cloud task was run. Native OS tests are not run — docs-only.
