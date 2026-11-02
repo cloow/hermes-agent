@@ -688,10 +688,20 @@ reviewed with the same familiar approve/deny flow as dangerous commands:
 ```
 /skills pending             # list staged skill writes + a one-line gist each
 /skills diff <id>           # full unified diff (best viewed in CLI or dashboard)
-/skills approve <id>        # apply it (or 'all')
+/skills approve <id> [<id> ...]  # apply them (or 'all')
 /skills reject <id>         # drop it (or 'all')
 /skills approval on         # turn the gate on (or 'off') and persist it
 ```
+
+`approve` takes one or more ids separated by spaces or commas
+(`/skills approve a1b2c3d4, e5f6a7b8`); duplicates apply once, in the order
+given. The whole selection is checked first: a malformed id, an empty item
+between commas, or `all` mixed with ids applies nothing. Each id then gets its
+own result (approved, not pending, busy, failed, ...): a failed write stays
+pending for review, and an unknown id never stops the others. `reject` and
+`diff` take exactly one id. An approval that was interrupted or could not
+finish leaves `<id>.applying.json` behind; `/skills pending` lists it as
+needing reconciliation and `approve` never retries it.
 
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or

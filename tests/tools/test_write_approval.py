@@ -38,7 +38,7 @@ def test_list_pending_skips_non_dict_record(hermes_home):
     from tools import write_approval as wa
     wa.stage_write("memory", {"action": "add", "target": "user", "content": "ok"},
                    summary="ok", origin="foreground")
-    pending_dir = wa._pending_path("memory", "").parent
+    pending_dir = wa._pending_dir("memory")
     (pending_dir / "bad.json").write_text('"not a record"', encoding="utf-8")
     records = wa.list_pending("memory")
     assert len(records) == 1 and records[0]["payload"]["content"] == "ok"
@@ -409,7 +409,7 @@ def test_staged_hint_names_the_pending_dir_on_headless_surfaces(hermes_home, mon
     r = _stage_one_memory_write()
     assert "review with /memory pending" not in r["message"], r["message"]
     assert "pending records live in" in r["message"]
-    assert str(wa._pending_path(wa.MEMORY, "").parent) in r["message"]
+    assert str(wa._pending_dir(wa.MEMORY)) in r["message"]
     monkeypatch.delenv("HERMES_CRON_SESSION")
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-7")

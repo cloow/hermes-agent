@@ -280,6 +280,8 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
                         "error": (f"operations[{i}] ({op['action']} on '{names[i]}') failed: "
                                   f"{parsed.get('error', 'unknown error')} — batch aborted, {note}."),
                         "failed_index": i, "completed_before_failure": i}
+                    if rollback_failed:  # the skills are neither before nor after: /skills approve keeps its claim
+                        fail["rollback_failed"] = True
                     # Carry the failing op's teaching payload (patch's file_preview /
                     # fuzzy-match hints) through — without it the model recovers blind.
                     for k, v in parsed.items():

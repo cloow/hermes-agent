@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 import uuid
 from contextlib import suppress
@@ -62,13 +63,60 @@ def _normalize_enabled(value: Any) -> bool:
 
 # --- Pending store (file-backed) ---
 
+# How stage_write mints ids (uuid4().hex[:8]). Ids are typed by people (``/skills approve <id>``),
+# so only this exact shape names a record: never a path, a prefix, or another case (#119997).
+_PENDING_ID_RE = re.compile(r"[0-9a-f]{8}")
+# ``<id>.json`` moves here while an approval applies it; a leftover one needs a human (see claim_pending).
+_CLAIM_SUFFIX = ".applying.json"
+
+
+def is_pending_id(value: Any) -> bool:
+    return isinstance(value, str) and _PENDING_ID_RE.fullmatch(value) is not None
+
+
+def _pending_dir(subsystem: str) -> Path:
+    if subsystem not in _SUBSYSTEMS:
+        raise ValueError(f"unknown write-approval subsystem {subsystem!r}")
+    return get_hermes_home() / "pending" / subsystem
+
+
 def _pending_path(subsystem: str, pending_id: str) -> Path:
-    return get_hermes_home() / "pending" / subsystem / f"{pending_id}.json"
+    if not is_pending_id(pending_id):
+        raise ValueError(f"invalid pending id {pending_id!r}")
+    return _pending_dir(subsystem) / f"{pending_id}.json"
+
+
+def _claim_path(subsystem: str, pending_id: str) -> Path:
+    return _pending_path(subsystem, pending_id).with_name(f"{pending_id}{_CLAIM_SUFFIX}")
 
 
 def _pending_files(subsystem: str) -> list:
-    d = _pending_path(subsystem, "").parent
-    return list(d.glob("*.json")) if d.exists() else []
+    d = _pending_dir(subsystem)
+    return [p for p in d.glob("*.json") if is_pending_id(p.stem)] if d.exists() else []
+
+
+def _read_record(path: Path, subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
+    """The record at ``path`` if it is a regular file (a symlink is refused, not followed) holding
+    a well-formed record for exactly this subsystem and id; else None."""
+    if path.is_symlink():
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):  # a FIFO or device is never a record
+                return None
+            record = json.loads(fh.read().decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    created = record.get("created_at") if isinstance(record, dict) else None
+    if (not isinstance(record, dict) or record.get("id") != pending_id or record.get("subsystem") != subsystem
+            or not isinstance(record.get("payload"), dict)
+            or isinstance(created, bool) or not isinstance(created, (int, float)) or created != created):
+        return None
+    return record
 
 
 def stage_write(subsystem: str, payload: dict[str, Any], *, summary: str, origin: str) -> dict[str, Any]:
@@ -90,52 +138,134 @@ def stage_write(subsystem: str, payload: dict[str, Any], *, summary: str, origin
 
 
 def list_pending(subsystem: str) -> list[dict[str, Any]]:
-    """Return all pending records for ``subsystem``, oldest first."""
+    """Return all approvable pending records for ``subsystem``, oldest first (claims and invalid
+    records are reported by :func:`list_unapprovable`)."""
     records: list[dict[str, Any]] = []
     for p in _pending_files(subsystem):
-        try:
-            record = json.loads(p.read_text(encoding="utf-8-sig"))
-            if not isinstance(record, dict):
-                raise ValueError(f"expected a JSON object, got {type(record).__name__}")
-            records.append(record)
-        except Exception:
-            logger.warning("Skipping unreadable pending record: %s", p)
-    records.sort(key=lambda r: r.get("created_at", 0))
+        record = _read_record(p, subsystem, p.stem)
+        if record is None:
+            logger.warning("Skipping unreadable or invalid pending record: %s", p)
+            continue
+        records.append(record)
+    records.sort(key=lambda r: r["created_at"])
     return records
 
 
+def list_unapprovable(subsystem: str) -> list[tuple[str, str]]:
+    """``(id, kind)`` for store entries a person must look at: ``"claimed"`` — an approval was
+    interrupted or could not finish (``<id>.applying.json``), never retried automatically — and
+    ``"invalid"`` — a record that is unreadable, redirected, or not what its file name says."""
+    d = _pending_dir(subsystem)
+    if not d.exists():
+        return []
+    out = [(p.name[:-len(_CLAIM_SUFFIX)], "claimed") for p in d.glob(f"*{_CLAIM_SUFFIX}")
+           if is_pending_id(p.name[:-len(_CLAIM_SUFFIX)])]
+    out += [(p.stem, "invalid") for p in _pending_files(subsystem) if _read_record(p, subsystem, p.stem) is None]
+    return sorted(out)
+
+
 def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
-    """Return a single pending record by id, or None."""
-    path = _pending_path(subsystem, pending_id)
-    if not path.exists():
+    """Return a single valid pending record by id, or None."""
+    if not is_pending_id(pending_id):
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    return _read_record(_pending_path(subsystem, pending_id), subsystem, pending_id)
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
-    """Delete a pending record. Returns True if it existed."""
+    """Delete a pending record (valid or not, so a broken one can be rejected; a symlink is
+    removed, never followed). Returns True if it existed. A claimed record is not pending."""
+    if not is_pending_id(pending_id):
+        return False
     try:
-        path = _pending_path(subsystem, pending_id)
-        if path.exists():
-            path.unlink()
-            return True
-    except Exception as e:  # pragma: no cover
+        _pending_path(subsystem, pending_id).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as e:  # pragma: no cover
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
     return False
 
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
-    d = _pending_path(subsystem, "").parent
+    d = _pending_dir(subsystem)
     if not d.exists():
         return 0
     with suppress(Exception):
         return sum(1 for _ in d.glob("*.json"))
     return 0
+
+
+# --- Approval claim ---
+# One pending record is one transaction. Approving it first moves ``<id>.json`` to
+# ``<id>.applying.json`` in the same directory without ever replacing an existing file, so of two
+# approvers (two chat surfaces, a double-sent command) exactly one applies it. Only a confirmed
+# no-effect failure puts the record back; a crash, an uncertain rollback or a failed cleanup leaves
+# the claim for a person to reconcile. Not exactly-once side effects: a claim never replays.
+
+CLAIMED, MISSING, BUSY, INVALID, STORE_ERROR = "claimed", "missing", "busy", "invalid", "store_error"
+
+
+def _move_no_replace(src: Path, dst: Path) -> None:
+    """Atomically give ``src`` the name ``dst``; FileExistsError when ``dst`` exists (a hard link
+    is created exclusively, unlike a rename, which would silently replace it)."""
+    os.link(src, dst)
+    try:
+        os.unlink(src)
+    except FileNotFoundError:  # a concurrent reject already dropped the old name
+        pass
+    except OSError:  # never leave one record under both names
+        with suppress(OSError):
+            os.unlink(dst)
+        raise
+
+
+def claim_pending(subsystem: str, pending_id: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """Claim a pending record for applying: ``(CLAIMED, record)``, or ``(MISSING|BUSY|INVALID|
+    STORE_ERROR, None)`` with nothing changed. Finish with :func:`release_claim` or :func:`restore_claim`."""
+    src, claim = _pending_path(subsystem, pending_id), _claim_path(subsystem, pending_id)
+    if claim.is_symlink() or claim.exists():
+        return BUSY, None
+    if src.is_symlink() or not src.exists():
+        return (INVALID if src.is_symlink() else MISSING), None
+    if _read_record(src, subsystem, pending_id) is None:
+        return INVALID, None
+    try:
+        _move_no_replace(src, claim)
+    except FileExistsError:
+        return BUSY, None
+    except FileNotFoundError:
+        return MISSING, None
+    except OSError:
+        logger.warning("write_approval: could not claim %s/%s", subsystem, pending_id, exc_info=True)
+        return STORE_ERROR, None
+    record = _read_record(claim, subsystem, pending_id)
+    if record is None:  # changed between the check and the claim: hand it back for fresh review
+        restore_claim(subsystem, pending_id)
+        return INVALID, None
+    return CLAIMED, record
+
+
+def release_claim(subsystem: str, pending_id: str) -> bool:
+    """Drop the claim of a record that was applied. False when the claim file could not be removed
+    (it then stays, listed for reconciliation, and is never re-applied)."""
+    try:
+        _claim_path(subsystem, pending_id).unlink()
+        return True
+    except OSError:
+        logger.warning("write_approval: could not remove the claim on %s/%s", subsystem, pending_id, exc_info=True)
+        return False
+
+
+def restore_claim(subsystem: str, pending_id: str) -> bool:
+    """Put a claimed record back in the queue after a confirmed no-effect failure. Never replaces a
+    record that took its name meanwhile: False keeps the claim for reconciliation."""
+    try:
+        _move_no_replace(_claim_path(subsystem, pending_id), _pending_path(subsystem, pending_id))
+        return True
+    except OSError:
+        logger.warning("write_approval: could not restore the claim on %s/%s", subsystem, pending_id, exc_info=True)
+        return False
 
 
 # --- Write origin ---
@@ -192,7 +322,7 @@ def _staged(subsystem: str) -> GateDecision:
     if _slash_review_surface():
         where = f"review with {command}"
     else:
-        where = (f"pending records live in {_pending_path(subsystem, '').parent} "
+        where = (f"pending records live in {_pending_dir(subsystem)} "
                  f"(review from an interactive CLI session with {command})")
     return GateDecision(stage=True, message=(f"Staged for approval ({subsystem}.write_approval is on). "
                                              f"Not yet saved — {where}."))

@@ -16,8 +16,9 @@ def _fmt_state(subsystem: str) -> str:
 
 def _fmt_pending_list(subsystem: str) -> str:
     records = wa.list_pending(subsystem)
+    attention = _fmt_unapprovable(subsystem)
     if not records:
-        return f"No pending {subsystem} writes."
+        return "\n".join([f"No pending {subsystem} writes.", *attention])
     lines = [f"Pending {subsystem} writes ({len(records)}):"]
     for r in records:
         origin = r.get("origin", "foreground")
@@ -25,11 +26,29 @@ def _fmt_pending_list(subsystem: str) -> str:
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
         if subsystem == wa.MEMORY:
             lines.extend(f"      {line}" for line in _matched_entries(r["payload"]))
+    lines.extend(attention)
     lines.append("")
-    lines.append(f"Apply: /{subsystem} approve <id>   Reject: /{subsystem} reject <id>")
+    lines.append(f"Apply: /{subsystem} approve <id> [<id> ...]   Reject: /{subsystem} reject <id>")
     if subsystem == wa.SKILLS:
         lines.append("Review full diff: /skills diff <id>")
     return "\n".join(lines)
+
+
+def _fmt_unapprovable(subsystem: str) -> list[str]:
+    """Store entries approve refuses, so a person can see and settle them."""
+    entries = wa.list_unapprovable(subsystem)
+    if not entries:
+        return []
+    store = wa._pending_dir(subsystem)
+    lines = ["", f"Needs attention ({len(entries)}, not approvable):"]
+    for pid, kind in entries:
+        if kind == "claimed":
+            lines.append(f"  {pid}  approval interrupted or unfinished — needs reconciliation: check whether it "
+                         f"took effect, then remove {store / (pid + '.applying.json')}")
+        else:
+            lines.append(f"  {pid}  unreadable or invalid record — inspect {store / (pid + '.json')} "
+                         f"or /{subsystem} reject {pid}")
+    return lines
 
 
 def handle_pending_subcommand(
@@ -57,37 +76,72 @@ def handle_pending_subcommand(
     return None  # not ours — caller handles
 
 
-def _usage(subsystem: str) -> str:
-    return f"Usage: /{subsystem} approve|reject <id>  (or 'all')"
+def _usage(subsystem: str, verb: str = "approve|reject") -> str:
+    return f"Usage: /{subsystem} {verb} <id>  (or 'all')"
+
+
+def _approve_usage(subsystem: str) -> str:
+    return (f"Usage: /{subsystem} approve <id> [<id> ...]  (ids separated by spaces or commas), "
+            f"or /{subsystem} approve all")
+
+
+def parse_selection(args: list[str]) -> str | list[str]:
+    """``"all"`` or the selected ids in first-occurrence order. Whitespace and commas separate
+    ids; every id must be exactly as minted (8 lowercase hex), with no repair. Raises ValueError
+    for an empty selection, an empty comma item, a malformed id, or ``all`` with anything else."""
+    text = " ".join(args)
+    if not text.strip():
+        raise ValueError("no ids given")
+    tokens: list[str] = []
+    for item in text.split(","):
+        words = item.split()
+        if not words:
+            raise ValueError("empty item between commas")
+        tokens.extend(words)
+    if any(t.lower() == "all" for t in tokens):
+        if len(tokens) != 1:
+            raise ValueError("'all' must be the only selection")
+        return "all"
+    for t in tokens:
+        if not wa.is_pending_id(t):
+            raise ValueError(f"{t[:40]!r} is not a pending id (8 lowercase hex characters)")
+    return list(dict.fromkeys(tokens))
+
+
+# outcome -> (label in the totals line, counts as applied)
+_OUTCOMES = {
+    "approved": ("approved", True), "cleanup_failed": ("applied with cleanup failure", True),
+    "missing": ("not pending", False), "busy": ("busy", False), "invalid": ("invalid", False),
+    "store_error": ("store error", False), "failed": ("failed", False), "conflict": ("conflicting", False), "uncertain": ("uncertain", False),
+    "interrupted": ("interrupted", False), "skipped": ("not attempted", False)}
 
 
 def _approve(subsystem: str, rest: list[str], memory_store) -> str:
-    if not rest:
-        return _usage(subsystem)
-    target = rest[0]
-    records = wa.list_pending(subsystem)
-    if not records:
-        return f"No pending {subsystem} writes."
-    if target.lower() == "all":
-        targets = list(records)
+    try:
+        selection = parse_selection(rest)
+    except ValueError as e:
+        return f"{_approve_usage(subsystem)}\n{e}. Nothing was applied."
+    if selection == "all":
+        ids = [r["id"] for r in wa.list_pending(subsystem)]  # the snapshot; later arrivals wait
+        if not ids:
+            return f"No pending {subsystem} writes."
     else:
-        rec = wa.get_pending(subsystem, target)
-        if not rec:
-            return f"No pending {subsystem} write with id '{target}'."
-        targets = [rec]
+        ids = selection
 
-    applied, failed, overwritten, patched, removed = 0, [], [], [], []
-    for rec in targets:
-        ok, msg, result = _apply_one(subsystem, rec, memory_store)
-        if ok:
-            wa.discard_pending(subsystem, rec["id"])
-            applied += 1
-            overwritten.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "replaced"))
-            patched.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "patched"))
-            removed.extend(f"  {rec['id']}: {text}" for text in _changed_entries(result, "removed"))
-        else:
-            failed.append(f"{rec['id']}: {msg}")
+    outcomes: list[tuple[str, str, str]] = []  # (id, outcome, line)
+    overwritten, patched, removed = [], [], []
+    for i, pid in enumerate(ids):
+        outcome, line, result = _approve_one(subsystem, pid, memory_store)
+        outcomes.append((pid, outcome, line))
+        if _OUTCOMES[outcome][1]:
+            overwritten.extend(f"  {pid}: {text}" for text in _changed_entries(result, "replaced"))
+            patched.extend(f"  {pid}: {text}" for text in _changed_entries(result, "patched"))
+            removed.extend(f"  {pid}: {text}" for text in _changed_entries(result, "removed"))
+        if outcome == "interrupted":  # stop before the next record; finished ones stay finished
+            outcomes.extend((rest_id, "skipped", f"{rest_id}: not attempted (stopped)") for rest_id in ids[i + 1:])
+            break
 
+    applied = sum(1 for _, o, _ in outcomes if _OUTCOMES[o][1])
     out = [f"Approved {applied} {subsystem} write(s)."]
     if overwritten:
         # A memory 'replace' overwrites the WHOLE matched entry (#117952); the approver
@@ -101,10 +155,41 @@ def _approve(subsystem: str, rest: list[str], memory_store) -> str:
     if removed:
         out.append("Removed entry (re-add anything you still need):")
         out.extend(removed)
-    if failed:
-        out.append("Failed:")
-        out.extend(f"  {f}" for f in failed)
+    counts = {label: sum(1 for _, o, _ in outcomes if o == key) for key, (label, _) in _OUTCOMES.items()}
+    totals = ", ".join(f"{n} {label}" for label, n in counts.items() if n)
+    out.append(f"{len(outcomes)} selected: {totals}")
+    out.extend(f"  {line}" for _, _, line in outcomes)
     return "\n".join(out)
+
+
+def _approve_one(subsystem: str, pid: str, memory_store) -> tuple[str, str, dict]:
+    """Claim, apply and settle one record: ``(outcome, line, applier result)``. Each record is its
+    own transaction; only a confirmed no-effect failure puts it back in the queue."""
+    state, rec = wa.claim_pending(subsystem, pid)
+    if state != wa.CLAIMED:
+        outcome, line = {
+            wa.MISSING: ("missing", f"{pid}: not pending"),
+            wa.BUSY: ("busy", f"{pid}: busy — being applied elsewhere or interrupted earlier; "
+                              f"see /{subsystem} pending"),
+            wa.INVALID: ("invalid", f"{pid}: invalid record, not applied — inspect it or /{subsystem} reject {pid}"),
+            wa.STORE_ERROR: ("store_error", f"{pid}: could not be claimed (pending store error); left pending"),
+        }[state]
+        return outcome, line, {}
+    try:
+        ok, err, result, certain = _apply_one(subsystem, rec, memory_store)
+    except KeyboardInterrupt:
+        return "interrupted", f"{pid}: interrupted; claim kept for reconciliation", {}
+    if ok:
+        if wa.release_claim(subsystem, pid):
+            return "approved", f"{pid}: approved", result
+        return ("cleanup_failed", f"{pid}: applied, but its claim file could not be removed; kept for "
+                                  f"reconciliation and never re-applied", result)
+    if not certain:
+        return "uncertain", f"{pid}: outcome uncertain ({err}); claim kept for reconciliation", {}
+    if wa.restore_claim(subsystem, pid):
+        return "failed", f"{pid}: failed ({err}); left pending", {}
+    return "conflict", (f"{pid}: failed ({err}); claim kept — it could not go back in the queue "
+                        f"(its id is taken again or the store refused), reconcile by hand"), {}
 
 
 def _changed_entries(result: dict, kind: str) -> list[str]:
@@ -126,27 +211,44 @@ def _matched_entries(payload) -> list[str]:
 
 
 def _apply_one(subsystem: str, rec, memory_store):
-    """``(ok, error, result)`` — *result* is the applier's full payload (empty on exceptions)."""
+    """``(ok, error, result, certain)`` — *result* is the applier's full payload. A failure the
+    applier reported (after its own rollback) left nothing behind; an exception, an unreadable
+    result or a failed rollback did not settle that (``certain`` False)."""
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
             if memory_store is None:
-                return False, "memory store unavailable", {}
+                return False, "memory store unavailable", {}, True
             from tools.memory_tool import apply_memory_pending
             result = apply_memory_pending(payload, memory_store)
         else:
             from tools.skill_manager_tool import apply_skill_pending
             result = json.loads(apply_skill_pending(payload))
-        return bool(result.get("success")), result.get("error", ""), result
     except Exception as e:
-        return False, str(e), {}
+        return False, str(e), {}, False
+    if not isinstance(result, dict):
+        return False, "unreadable applier result", {}, False
+    return bool(result.get("success")), result.get("error", ""), result, not result.get("rollback_failed")
+
+
+def _single_target(subsystem: str, verb: str, rest: list[str], *, allow_all: bool):
+    """The one id (or ``all``) a single-record verb names, else the reply explaining why not."""
+    if len(rest) != 1 or "," in rest[0]:
+        return None, (_usage(subsystem, verb) if allow_all else f"Usage: /{subsystem} {verb} <id>")
+    target = rest[0]
+    if allow_all and target.lower() == "all":
+        return "all", None
+    if not wa.is_pending_id(target):
+        return None, (f"{target[:40]!r} is not a pending id (8 lowercase hex characters, "
+                      f"as /{subsystem} pending shows them).")
+    return target, None
 
 
 def _reject(subsystem: str, rest: list[str]) -> str:
-    if not rest:
-        return _usage(subsystem)
-    target = rest[0]
-    if target.lower() == "all":
+    target, err = _single_target(subsystem, "reject", rest, allow_all=True)
+    if err:
+        return err
+    if target == "all":
         n = sum(1 for rec in wa.list_pending(subsystem) if wa.discard_pending(subsystem, rec["id"]))
         return f"Rejected {n} pending {subsystem} write(s)."
     if wa.discard_pending(subsystem, target):
@@ -155,11 +257,12 @@ def _reject(subsystem: str, rest: list[str]) -> str:
 
 
 def _diff(rest: list[str]) -> str:
-    if not rest:
-        return "Usage: /skills diff <id>"
-    rec = wa.get_pending(wa.SKILLS, rest[0])
+    target, err = _single_target(wa.SKILLS, "diff", rest, allow_all=False)
+    if err:
+        return err
+    rec = wa.get_pending(wa.SKILLS, target)
     if not rec:
-        return f"No pending skill write with id '{rest[0]}'."
+        return f"No pending skill write with id '{target}'."
     return f"# Pending skill write {rec['id']}: {rec.get('summary', '')}\n\n" + wa.skill_pending_diff(rec)
 
 

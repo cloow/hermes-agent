@@ -344,7 +344,7 @@ Review staged writes from the CLI or any messaging platform:
 
 ```
 /memory pending             # list staged memory writes (auto ones tagged [auto])
-/memory approve <id>        # apply one (or 'all')
+/memory approve <id> [<id> ...]  # apply them (or 'all'); ids split by spaces or commas
 /memory reject <id>         # drop one (or 'all')
 /memory approval on         # turn the gate on (or 'off') and persist it
 ```
@@ -530,7 +530,7 @@ inline, but the full diff stays out-of-band:
 ```
 /skills pending             # list staged skill writes + a one-line gist each
 /skills diff <id>           # full unified diff (best viewed in CLI or dashboard)
-/skills approve <id>        # apply it (or 'all')
+/skills approve <id> [<id> ...]  # apply them (or 'all'); ids split by spaces or commas
 /skills reject <id>         # drop it (or 'all')
 /skills approval on         # turn the gate on (or 'off') and persist it
 ```

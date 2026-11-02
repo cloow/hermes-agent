@@ -261,6 +261,7 @@ class TestSkillManageBatch(unittest.TestCase):
             ])
         self.assertFalse(r["success"], r)
         self.assertIn("ROLLBACK FAILED", r["error"])
+        self.assertIs(r.get("rollback_failed"), True)
         # The skill directory was NOT destroyed by the failed rollback:
         # the half applied state survives instead of nothing at all.
         skill_md = os.path.join(self.home, "skills", "probe", "SKILL.md")
