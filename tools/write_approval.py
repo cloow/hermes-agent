@@ -11,8 +11,10 @@ interactive CLI only) or **stages** the write under
 
 from __future__ import annotations
 
+import ctypes
 import difflib
 import errno
+import functools
 import json
 import logging
 import math
@@ -74,9 +76,17 @@ _CLAIM_SUFFIX = ".applying.json"
 _STORE_LOCK = ".store.lock"
 _store_lock_holder = threading.local()
 
+# Store states of one id (peek_pending, claim_pending, discard_pending).
+PENDING, CLAIMED, MISSING, BUSY, INVALID, CHANGED, STORE_ERROR, DISCARDED = (
+    "pending", "claimed", "missing", "busy", "invalid", "changed", "store_error", "discarded")
+
 
 class PendingStoreError(OSError):
     """The pending store cannot be used safely (redirected out of the Hermes home, or locked too long)."""
+
+
+class _Changed(Exception):
+    """The source name stopped naming the record being moved."""
 
 
 def is_pending_id(value: Any) -> bool:
@@ -101,10 +111,6 @@ def _pending_path(subsystem: str, pending_id: str) -> Path:
     return _pending_dir(subsystem) / f"{pending_id}.json"
 
 
-def _claim_path(subsystem: str, pending_id: str) -> Path:
-    return _pending_path(subsystem, pending_id).with_name(f"{pending_id}{_CLAIM_SUFFIX}")
-
-
 def _claimed_ids(d: Path) -> set[str]:
     return {i for i in (p.name[:-len(_CLAIM_SUFFIX)] for p in d.glob(f"*{_CLAIM_SUFFIX}")) if is_pending_id(i)}
 
@@ -119,41 +125,46 @@ def _pending_files(subsystem: str) -> list:
     return [p for p in d.glob("*.json") if is_pending_id(p.stem) and p.stem not in claimed]
 
 
-@contextmanager
-def _store_lock(subsystem: str):
-    """Cross-process lock serializing claim, restore and discard in one subsystem's store, so a reject
-    and an approve of one id can never both succeed."""
-    from hermes_cli.auth import _file_lock
-    d = _pending_dir(subsystem)
+def _valid_created_at(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
     try:
-        with _file_lock(d / _STORE_LOCK, _store_lock_holder, 15.0, f"Timed out waiting for the {subsystem} pending store"):
-            yield
-    except TimeoutError as e:
-        raise PendingStoreError(str(e)) from e
+        return math.isfinite(value) and value > 0
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def _parse_record(fd: int, subsystem: str, pending_id: str
+                  ) -> tuple[Optional[dict[str, Any]], Optional[tuple[int, int]]]:
+    """``(record, (st_dev, st_ino))`` from an open fd (closed here). The identity is the fstat of the very
+    bytes that were parsed; the record is None unless it is a regular file holding a well-formed record
+    for exactly this subsystem and id."""
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):  # a FIFO or device is never a record
+            return None, None
+        try:
+            record = json.loads(fh.read().decode("utf-8-sig"))
+        except (OSError, ValueError):
+            return None, (st.st_dev, st.st_ino)
+    if (not isinstance(record, dict) or record.get("id") != pending_id or record.get("subsystem") != subsystem
+            or not isinstance(record.get("payload"), dict) or not _valid_created_at(record.get("created_at"))):
+        return None, (st.st_dev, st.st_ino)
+    return record, (st.st_dev, st.st_ino)
+
+
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
 
 def _read_record(path: Path, subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
-    """The record at ``path`` if it is a regular file (a symlink is refused, not followed) holding
-    a well-formed record for exactly this subsystem and id; else None."""
+    """The record at ``path`` (a symlink is refused, not followed), or None."""
     if path.is_symlink():
         return None
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, _READ_FLAGS)
     except OSError:
         return None
-    try:
-        with os.fdopen(fd, "rb") as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):  # a FIFO or device is never a record
-                return None
-            record = json.loads(fh.read().decode("utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    created = record.get("created_at") if isinstance(record, dict) else None
-    if (not isinstance(record, dict) or record.get("id") != pending_id or record.get("subsystem") != subsystem
-            or not isinstance(record.get("payload"), dict)
-            or isinstance(created, bool) or not isinstance(created, (int, float)) or not math.isfinite(created)):
-        return None
-    return record
+    return _parse_record(fd, subsystem, pending_id)[0]
 
 
 def stage_write(subsystem: str, payload: dict[str, Any], *, summary: str, origin: str) -> dict[str, Any]:
@@ -200,34 +211,25 @@ def list_unapprovable(subsystem: str) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def peek_pending(subsystem: str, pending_id: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """``(PENDING, record)`` for an approvable record, else ``(MISSING|BUSY|INVALID, None)``. Changes
+    nothing; an approval passes the record on to :func:`claim_pending` as what was reviewed."""
+    path = _pending_path(subsystem, pending_id)
+    if os.path.lexists(path.with_name(f"{pending_id}{_CLAIM_SUFFIX}")):
+        return BUSY, None
+    if not os.path.lexists(path):
+        return MISSING, None
+    record = _read_record(path, subsystem, pending_id)
+    return (PENDING, record) if record is not None else (INVALID, None)
+
+
 def is_claimed(subsystem: str, pending_id: str) -> bool:
-    return is_pending_id(pending_id) and os.path.lexists(_claim_path(subsystem, pending_id))
+    return is_pending_id(pending_id) and peek_pending(subsystem, pending_id)[0] == BUSY
 
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[dict[str, Any]]:
     """Return a single valid pending record by id, or None (also while it is claimed)."""
-    if not is_pending_id(pending_id) or is_claimed(subsystem, pending_id):
-        return None
-    return _read_record(_pending_path(subsystem, pending_id), subsystem, pending_id)
-
-
-def discard_pending(subsystem: str, pending_id: str) -> bool:
-    """Delete a pending record (valid or not, so a broken one can be rejected; a symlink is
-    removed, never followed). Returns True if it existed. A claimed id is not pending: its record is
-    left for whoever reconciles the claim."""
-    if not is_pending_id(pending_id):
-        return False
-    try:
-        with _store_lock(subsystem):
-            if is_claimed(subsystem, pending_id):
-                return False
-            _pending_path(subsystem, pending_id).unlink()
-            return True
-    except FileNotFoundError:
-        return False
-    except OSError as e:
-        logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
-    return False
+    return peek_pending(subsystem, pending_id)[1] if is_pending_id(pending_id) else None
 
 
 def pending_count(subsystem: str) -> int:
@@ -247,77 +249,175 @@ def has_review_items(subsystem: str) -> bool:
         return True
 
 
-# --- Approval claim ---
+# --- Store mutations: claim, release, restore, discard ---
 # One pending record is one transaction. Approving it first moves ``<id>.json`` to
 # ``<id>.applying.json`` in the same directory, under the store lock and without ever replacing a file,
 # so of two approvers (two chat surfaces, a double-sent command) exactly one applies it, and an approve
-# and a reject of one id never both succeed. The claim is bound to the record that was checked: a record
-# changed in between goes back for fresh review. Only a confirmed no-effect failure puts the record back;
-# a crash, an uncertain outcome or a failed cleanup leaves the claim for a person to reconcile.
-# Not exactly-once side effects: a claim is never replayed.
+# and a reject of one id never both succeed. The claim is bound to the record that was reviewed and to
+# the bytes that were checked: a record changed or replaced in between goes back for fresh review. Only
+# a confirmed no-effect failure puts the record back; a crash, an uncertain outcome or a failed cleanup
+# leaves the claim for a person to reconcile. Not exactly-once side effects: a claim is never replayed.
 
-CLAIMED, MISSING, BUSY, INVALID, CHANGED, STORE_ERROR = (
-    "claimed", "missing", "busy", "invalid", "changed", "store_error")
+_RENAME_NOREPLACE = 1  # Linux renameat2
+_RENAME_EXCL = 0x4  # macOS renameatx_np
 
 
-def _move_no_replace(src: Path, dst: Path) -> None:
-    """Give ``src`` the name ``dst`` (caller holds the store lock); FileExistsError when ``dst`` exists,
-    FileNotFoundError when ``src`` is gone. A hard link is created exclusively and does not follow a
-    symlink, where supported; a store without hard links falls back to a rename, which the lock makes
-    no-replace for every store writer (Windows' rename never replaces)."""
+@functools.cache
+def _libc():
+    if os.name == "nt":
+        return None
     try:
-        if os.link in os.supports_follow_symlinks:
-            os.link(src, dst, follow_symlinks=False)
-        else:
-            os.link(src, dst)
-    except (FileExistsError, FileNotFoundError):
-        raise
-    except OSError:  # no hard links here (FAT/exFAT, some network shares)
-        if os.path.lexists(dst):
-            raise FileExistsError(errno.EEXIST, "already exists", str(dst)) from None
-        os.rename(src, dst)
-        return
-    try:
-        os.unlink(src)
-    except OSError:  # never leave one record under both names
-        with suppress(OSError):
-            os.unlink(dst)
-        raise
-
-
-def _identity(path: Path) -> Optional[tuple[int, int]]:
-    try:
-        st = os.lstat(path)
+        return ctypes.CDLL(None, use_errno=True)
     except OSError:
         return None
-    return st.st_dev, st.st_ino
+
+
+def _renameat_noreplace(dir_fd: int, src: str, dst: str) -> bool:
+    """Atomically rename ``src`` to ``dst`` inside ``dir_fd`` unless ``dst`` exists (FileExistsError).
+    False when this kernel, libc or filesystem has no such rename (the caller falls back)."""
+    libc = _libc()
+    for name, flag in (("renameat2", _RENAME_NOREPLACE), ("renameatx_np", _RENAME_EXCL)):
+        fn = getattr(libc, name, None) if libc is not None else None
+        if fn is None:
+            continue
+        if fn(dir_fd, os.fsencode(src), dir_fd, os.fsencode(dst), flag) == 0:
+            return True
+        err = ctypes.get_errno()
+        if err in (errno.ENOSYS, errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL),
+                   getattr(errno, "EOPNOTSUPP", errno.EINVAL)):
+            return False
+        raise OSError(err, os.strerror(err), dst)  # EEXIST -> FileExistsError, ENOENT -> FileNotFoundError
+    return False
+
+
+class _Store:
+    """One subsystem's store, pinned for the duration of a locked mutation: on POSIX every name is
+    resolved relative to a directory fd opened without following links and checked to be the store,
+    so swapping the directory for a link after the check cannot move files outside it."""
+
+    def __init__(self, path: Path, fd: Optional[int]):
+        self.path, self.fd = path, fd
+
+    def _kw(self) -> dict[str, Any]:
+        return {"dir_fd": self.fd} if self.fd is not None else {}
+
+    def _p(self, name: str):
+        return name if self.fd is not None else self.path / name
+
+    def lexists(self, name: str) -> bool:
+        try:
+            os.stat(self._p(name), follow_symlinks=False, **self._kw())
+            return True
+        except FileNotFoundError:
+            return False
+
+    def identity(self, name: str) -> Optional[tuple[int, int]]:
+        try:
+            st = os.stat(self._p(name), follow_symlinks=False, **self._kw())
+        except FileNotFoundError:
+            return None
+        return st.st_dev, st.st_ino
+
+    def read(self, name: str, subsystem: str, pending_id: str):
+        try:
+            fd = os.open(self._p(name), _READ_FLAGS, **self._kw())
+        except OSError:
+            return None, self.identity(name)
+        return _parse_record(fd, subsystem, pending_id)
+
+    def unlink(self, name: str) -> None:
+        os.unlink(self._p(name), **self._kw())
+
+    def move_no_replace(self, src: str, dst: str) -> None:
+        """Give the file named ``src`` the name ``dst``, never replacing ``dst`` (FileExistsError) and
+        never dropping a ``src`` that stopped naming the moved file (_Changed)."""
+        if self.fd is None:  # Windows: a rename never replaces its target
+            os.rename(self._p(src), self._p(dst))
+            return
+        if _renameat_noreplace(self.fd, src, dst):
+            return
+        kw = {"src_dir_fd": self.fd, "dst_dir_fd": self.fd}
+        try:
+            if os.link in os.supports_follow_symlinks:
+                os.link(src, dst, follow_symlinks=False, **kw)
+            else:
+                os.link(src, dst, **kw)
+        except (FileExistsError, FileNotFoundError):
+            raise
+        except OSError:  # no hard links either: a rename the store lock keeps from replacing a store file
+            if self.lexists(dst):
+                raise FileExistsError(errno.EEXIST, "already exists", dst) from None
+            os.rename(src, dst, **kw)
+            return
+        linked = self.identity(dst)
+        if self.identity(src) != linked:  # src was replaced after the link: keep the newcomer, undo ours
+            with suppress(OSError):
+                if self.identity(dst) == linked:
+                    self.unlink(dst)
+            raise _Changed(src)
+        try:
+            self.unlink(src)
+        except OSError:  # never leave one record under both names
+            with suppress(OSError):
+                self.unlink(dst)
+            raise
+
+
+@contextmanager
+def _store_lock(subsystem: str):
+    """Hold the subsystem's cross-process store lock and yield the pinned :class:`_Store`, or None when
+    the store does not exist (nothing to change: a lock must never create a deleted profile's dirs)."""
+    d = _pending_dir(subsystem)
+    if not d.is_dir():
+        yield None
+        return
+    from hermes_cli.auth import _file_lock
+    try:
+        with _file_lock(d / _STORE_LOCK, _store_lock_holder, 15.0, f"Timed out waiting for the {subsystem} pending store"):
+            if os.name == "nt":
+                yield _Store(_pending_dir(subsystem), None)  # re-checked under the lock
+                return
+            fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                pinned, now = os.fstat(fd), os.stat(_pending_dir(subsystem), follow_symlinks=False)
+                if (pinned.st_dev, pinned.st_ino) != (now.st_dev, now.st_ino):  # swapped after the check
+                    raise PendingStoreError(f"the {subsystem} pending store {d} changed while it was opened")
+                yield _Store(d, fd)
+            finally:
+                os.close(fd)
+    except TimeoutError as e:
+        raise PendingStoreError(str(e)) from e
 
 
 def claim_pending(subsystem: str, pending_id: str, expected: Optional[dict[str, Any]] = None
                   ) -> tuple[str, Optional[dict[str, Any]]]:
     """Claim a pending record for applying: ``(CLAIMED, record)``, or a refusal with the store left as it
-    was: MISSING, BUSY (claimed already), INVALID, CHANGED (not the record that was checked, or not
-    ``expected``: it stays pending for fresh review) or STORE_ERROR. Finish with :func:`release_claim`
-    or :func:`restore_claim`."""
-    src, claim = _pending_path(subsystem, pending_id), _claim_path(subsystem, pending_id)
+    was: MISSING, BUSY (claimed already), INVALID, CHANGED (not the bytes that were checked, or not
+    ``expected`` — the record reviewed when the command started; it stays pending for fresh review) or
+    STORE_ERROR. Finish with :func:`release_claim` or :func:`restore_claim`."""
+    src, claim = f"{pending_id}.json", f"{pending_id}{_CLAIM_SUFFIX}"
+    _pending_path(subsystem, pending_id)  # validates the id
     try:
-        with _store_lock(subsystem):
-            if os.path.lexists(claim):
+        with _store_lock(subsystem) as st:
+            if st is None or not st.lexists(src):
+                return (BUSY if st is not None and st.lexists(claim) else MISSING), None
+            if st.lexists(claim):
                 return BUSY, None
-            if not os.path.lexists(src):
-                return MISSING, None
-            checked, before = _read_record(src, subsystem, pending_id), _identity(src)
+            checked, before = st.read(src, subsystem, pending_id)
             if checked is None:
                 return INVALID, None
             if expected is not None and checked != expected:
                 return CHANGED, None
-            _move_no_replace(src, claim)
-            record = _read_record(claim, subsystem, pending_id)
-            if record == checked and _identity(claim) == before:
+            try:
+                st.move_no_replace(src, claim)
+            except _Changed:
+                return CHANGED, None
+            record, after = st.read(claim, subsystem, pending_id)
+            if record == checked and after == before:
                 return CLAIMED, record
-            try:  # changed between the check and the claim: hand it back for fresh review
-                _move_no_replace(claim, src)
-            except OSError:
+            try:  # replaced between the check and the claim: hand it back for fresh review
+                st.move_no_replace(claim, src)
+            except (OSError, _Changed):
                 logger.warning("write_approval: could not hand back %s/%s", subsystem, pending_id, exc_info=True)
                 return BUSY, None
             return CHANGED, None
@@ -334,7 +434,10 @@ def release_claim(subsystem: str, pending_id: str) -> bool:
     """Drop the claim of a record that was applied. False when the claim file could not be removed
     (it then stays, listed for reconciliation, and is never re-applied)."""
     try:
-        _claim_path(subsystem, pending_id).unlink()
+        with _store_lock(subsystem) as st:
+            if st is None:
+                return False
+            st.unlink(f"{pending_id}{_CLAIM_SUFFIX}")
         return True
     except OSError:
         logger.warning("write_approval: could not remove the claim on %s/%s", subsystem, pending_id, exc_info=True)
@@ -345,12 +448,37 @@ def restore_claim(subsystem: str, pending_id: str) -> bool:
     """Put a claimed record back in the queue after a confirmed no-effect failure. Never replaces a
     record that took its name meanwhile: False keeps the claim for reconciliation."""
     try:
-        with _store_lock(subsystem):
-            _move_no_replace(_claim_path(subsystem, pending_id), _pending_path(subsystem, pending_id))
+        with _store_lock(subsystem) as st:
+            if st is None:
+                return False
+            st.move_no_replace(f"{pending_id}{_CLAIM_SUFFIX}", f"{pending_id}.json")
         return True
-    except OSError:
+    except (OSError, _Changed):
         logger.warning("write_approval: could not restore the claim on %s/%s", subsystem, pending_id, exc_info=True)
         return False
+
+
+def discard_pending(subsystem: str, pending_id: str) -> str:
+    """Delete a pending record (valid or not, so a broken one can be rejected; a symlink is removed,
+    never followed): DISCARDED, MISSING, BUSY (claimed: left for whoever reconciles it) or STORE_ERROR.
+    A store that is redirected or stays locked raises :class:`PendingStoreError`."""
+    if not is_pending_id(pending_id):
+        return MISSING
+    try:
+        with _store_lock(subsystem) as st:
+            if st is None:
+                return MISSING
+            if st.lexists(f"{pending_id}{_CLAIM_SUFFIX}"):
+                return BUSY
+            st.unlink(f"{pending_id}.json")
+            return DISCARDED
+    except FileNotFoundError:
+        return MISSING
+    except PendingStoreError:
+        raise
+    except OSError as e:
+        logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
+        return STORE_ERROR
 
 
 # --- Write origin ---

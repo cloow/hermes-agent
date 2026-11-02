@@ -61,7 +61,7 @@ def test_lookups_accept_only_minted_ids(home, bad):
     victim.write_text('{"id": "x", "payload": {}}')
     _stage_skill("hardening")
     assert wa.get_pending(wa.SKILLS, bad) is None
-    assert wa.discard_pending(wa.SKILLS, bad) is False
+    assert wa.discard_pending(wa.SKILLS, bad) == wa.MISSING
     assert victim.exists()
 
 
@@ -184,17 +184,18 @@ def test_failed_batch_rollback_keeps_the_claim(home, monkeypatch):
 
 
 def test_cleanup_failure_is_reported_and_never_replayed(home, monkeypatch):
+    import os
     pid = _stage_skill("sticky")
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
 
-    def flaky_unlink(self, *a, **k):
-        if self.name.endswith(".applying.json"):
+    def flaky_unlink(path, *a, **k):
+        if str(path).endswith(".applying.json"):
             raise PermissionError("read-only store")
-        return real_unlink(self, *a, **k)
+        return real_unlink(path, *a, **k)
 
-    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    monkeypatch.setattr(os, "unlink", flaky_unlink)
     out = _skills(f"approve {pid}")
-    monkeypatch.setattr(Path, "unlink", real_unlink)
+    monkeypatch.setattr(os, "unlink", real_unlink)
     assert f"{pid}: applied, but its claim file could not be removed" in out, out
     assert "Approved 1 skills write(s)." in out
     assert (home / "skills" / "sticky" / "SKILL.md").is_file()
@@ -262,6 +263,7 @@ def test_a_store_without_hard_links_still_claims_once(home, monkeypatch):
         assert f"{pid}: busy" in _skills(f"approve {pid}")
         return real(payload)
 
+    monkeypatch.setattr(wa, "_renameat_noreplace", lambda *a: False, raising=False)  # nor an atomic no-replace rename
     monkeypatch.setattr(os, "link", refuse)
     _patch_applier(monkeypatch, applier)
     out = _skills(f"approve {pid}")
@@ -276,6 +278,7 @@ def test_a_store_that_refuses_the_claim_leaves_the_record_pending(home, monkeypa
     def refuse(*a, **k):
         raise PermissionError("store is read-only")
 
+    monkeypatch.setattr(wa, "_renameat_noreplace", lambda *a: False, raising=False)  # no atomic rename here either
     monkeypatch.setattr(os, "link", refuse)
     monkeypatch.setattr(os, "rename", refuse)
     _patch_applier(monkeypatch, lambda payload: pytest.fail("an unclaimed record must not be applied"))
@@ -294,6 +297,7 @@ def test_a_failed_unlink_after_the_claim_link_leaves_one_name(home, monkeypatch)
             raise PermissionError("sticky directory")
         return real_unlink(path, *a, **k)
 
+    monkeypatch.setattr(wa, "_renameat_noreplace", lambda *a: False, raising=False)  # exercise the hard-link fallback
     monkeypatch.setattr(os, "unlink", flaky)
     _patch_applier(monkeypatch, lambda payload: pytest.fail("an unclaimed record must not be applied"))
     out = _skills(f"approve {pid}")
