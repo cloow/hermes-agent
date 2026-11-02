@@ -157,6 +157,9 @@ def _run_selection(subsystem: str, start: dict, memory_store) -> list[tuple[str,
         if current is not None:
             outcomes.append((current, "interrupted", f"{current}: interrupted — see /{subsystem} pending: it is "
                                                      f"still pending or claimed for reconciliation", {}))
+    except wa.PendingStoreError as e:  # the store as a whole (locked too long, redirected): stop here
+        if current is not None:
+            outcomes.append((current, "store_error", f"{current}: not applied — {e}", {}))
     done = {pid for pid, *_ in outcomes}
     outcomes.extend((pid, "skipped", f"{pid}: not attempted (stopped)", {}) for pid in start if pid not in done)
     return outcomes

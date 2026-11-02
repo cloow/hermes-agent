@@ -9,6 +9,7 @@ pending; and a locked skill stays protected inside a batch. Temp HERMES_HOME, fa
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -94,21 +95,19 @@ def _hook_move(monkeypatch, path: str, pid: str, hook) -> None:
 @pytest.mark.parametrize("path", ["rename", "link"])
 def test_approve_and_reject_of_one_id_never_both_succeed(home, monkeypatch, path):
     pid = _stage_skill("contested")
-    replies = {}
+    replies, threads = {}, []
 
-    def reject_from_another_surface():
+    def reject_from_another_surface():  # started mid-claim, never joined while the claim holds the lock
         t = threading.Thread(target=lambda: replies.setdefault("reject", _skills(f"reject {pid}")))
         t.start()
-        t.join(timeout=2)
-        replies["thread"] = t
+        threads.append(t)
 
     _hook_move(monkeypatch, path, pid, reject_from_another_surface)
     out = _skills(f"approve {pid}")
-    replies["thread"].join(timeout=30)
-    approved = f"{pid}: approved" in out
-    rejected = "Rejected pending" in replies["reject"]
-    assert approved != rejected, f"exactly one may win:\n{out}\n{replies['reject']}"
-    assert (home / "skills" / "contested").exists() == approved
+    threads[0].join()
+    assert f"{pid}: approved" in out, out
+    assert "Rejected pending" not in replies["reject"], replies["reject"]
+    assert (home / "skills" / "contested").exists()
 
 
 @pytest.mark.parametrize("path", ["rename", "link"])
@@ -310,26 +309,220 @@ def test_review_of_a_profile_without_a_store_creates_nothing(tmp_path, monkeypat
 
 # ── 7b. the store directory is pinned across the lock ────────────────────────
 
+def _swap_store_for_link(home, outside) -> None:
+    _store(home).rename(home / "pending" / "skills.moved")
+    _store(home).symlink_to(outside, target_is_directory=True)
+
+
 @pytest.mark.platforms("posix")
-def test_a_store_swapped_for_a_link_after_the_check_is_not_used(home, tmp_path, monkeypatch):
+@pytest.mark.parametrize("when", ["before_open", "after_open"])
+def test_a_store_swapped_for_a_link_after_the_check_is_not_used(home, tmp_path, monkeypatch, when):
     from hermes_cli import auth
     pid = _stage_skill("pinned")
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / f"{pid}.json").write_text((_store(home) / f"{pid}.json").read_text())
-    real_lock, swapped = auth._file_lock, []
+    swapped = []
 
-    def swap_then_lock(*a, **k):
+    def swap_once():
         if not swapped:
             swapped.append(1)
-            _store(home).rename(home / "pending" / "skills.moved")
-            _store(home).symlink_to(outside, target_is_directory=True)
-        return real_lock(*a, **k)
+            _swap_store_for_link(home, outside)
 
-    monkeypatch.setattr(auth, "_file_lock", swap_then_lock)
+    if when == "before_open":  # between the path check and opening the store (also where a lock file was opened)
+        real_dir, real_lock = wa._pending_dir, auth._file_lock
+
+        def checked_then_swapped(subsystem):
+            d = real_dir(subsystem)
+            swap_once()
+            return d
+
+        monkeypatch.setattr(wa, "_pending_dir", checked_then_swapped)
+        monkeypatch.setattr(auth, "_file_lock", lambda *a, **k: (swap_once(), real_lock(*a, **k))[1])
+    else:  # the store was opened, then swapped before the lock was taken
+        real_flock = getattr(wa, "_flock_with_deadline", None)
+        monkeypatch.setattr(wa, "_flock_with_deadline", lambda fd, s: (swap_once(), real_flock(fd, s)), raising=False)
     out = _skills(f"approve {pid}")
     assert not list(outside.glob("*.applying.json")) and (outside / f"{pid}.json").exists(), out
+    assert not (outside / ".store.lock").exists(), "nothing may be created through the link"
     assert not (home / "skills" / "pinned").exists() and "Approved 0" in out, out
+    assert "pending store" in out, out
+
+
+# ── round 3: the lock itself ─────────────────────────────────────────────────
+
+@pytest.mark.platforms("posix")
+def test_a_lock_file_link_is_never_followed(home):
+    pid = _stage_skill("lock-link")
+    victim = home / "auth.json"
+    victim.write_text('{"keep": "me"}')
+    (_store(home) / ".store.lock").unlink(missing_ok=True)
+    (_store(home) / ".store.lock").symlink_to(victim)
+    out = _skills(f"approve {pid}")
+    assert f"{pid}: approved" in out, out
+    assert victim.read_text() == '{"keep": "me"}', "the link target must be untouched"
+
+
+@pytest.mark.parametrize("when", ["after_check", "before_lock"])
+def test_a_profile_deleted_before_the_lock_stays_deleted(tmp_path, monkeypatch, when):
+    import shutil
+
+    from hermes_cli import auth
+    gone = tmp_path / "doomed-profile"
+    monkeypatch.setenv("HERMES_HOME", str(gone))
+    _stage_skill("doomed")
+
+    def delete():
+        shutil.rmtree(gone, ignore_errors=True)
+
+    if when == "before_lock":  # removed just before the lock is taken (a path-based lock file would mkdir)
+        real_lock, real_flock = auth._file_lock, getattr(wa, "_flock_with_deadline", None)
+        monkeypatch.setattr(auth, "_file_lock", lambda *a, **k: (delete(), real_lock(*a, **k))[1])
+        monkeypatch.setattr(wa, "_flock_with_deadline", lambda fd, s: (delete(), real_flock(fd, s)), raising=False)
+    else:  # removed right after the store path was checked
+        real_dir = wa._pending_dir
+        monkeypatch.setattr(wa, "_pending_dir", lambda subsystem: (real_dir(subsystem), delete())[0])
+    _skills("reject 0badc0de")
+    assert not gone.exists(), sorted(str(p) for p in gone.rglob("*"))
+
+
+def test_staging_never_replaces_an_existing_record(home, monkeypatch):
+    import uuid as uuid_mod
+    taken = _stage_skill("first-come")
+    before = (_store(home) / f"{taken}.json").read_text()
+    real, forced = uuid_mod.uuid4, []
+
+    def collide():
+        if not forced:
+            forced.append(1)
+            return uuid_mod.UUID(taken + "0" * 24)
+        return real()
+
+    monkeypatch.setattr(uuid_mod, "uuid4", collide)
+    rec = _stage_skill("second-come")
+    assert rec != taken and (_store(home) / f"{taken}.json").read_text() == before
+    assert {r["payload"]["name"] for r in wa.list_pending(wa.SKILLS)} == {"first-come", "second-come"}
+
+
+def test_staging_publishes_under_the_store_lock(home, monkeypatch):
+    _stage_skill("make-the-store")
+    real_lock, seen = wa._store_lock, []
+
+    def names():
+        return {p.name for p in _store(home).glob("*.json")}
+
+    @contextlib.contextmanager
+    def watched(subsystem, *a, **k):
+        with real_lock(subsystem, *a, **k) as st:
+            inside = names()
+            yield st
+            seen.append(names() - inside)
+
+    monkeypatch.setattr(wa, "_store_lock", watched)
+    pid = _stage_skill("published-inside")
+    assert {f"{pid}.json"} in seen, seen
+
+
+def test_a_source_replaced_before_the_old_name_is_dropped_is_kept(home, monkeypatch):
+    pid = _stage_skill("old-reviewed")
+    monkeypatch.setattr(wa, "_renameat_noreplace", lambda *a: False, raising=False)  # the hard-link fallback
+    swapped, real_unlink, real_rename = [], os.unlink, os.rename
+
+    def swap_first(real):
+        def call(path, *a, **k):
+            if not swapped and str(path).endswith(f"{pid}.json") and ".applying" not in str(path):
+                swapped.append(1)  # an out-of-band writer replaces the source just before it is dropped
+                _rewrite_valid(home, pid, "new-unreviewed")
+            return real(path, *a, **k)
+        return call
+
+    monkeypatch.setattr(os, "unlink", swap_first(real_unlink))
+    monkeypatch.setattr(os, "rename", swap_first(real_rename))
+    out = _skills(f"approve {pid}")
+    assert swapped, "the drop step was reached"
+    assert not (home / "skills" / "old-reviewed").exists() and not (home / "skills" / "new-unreviewed").exists(), out
+    assert f"{pid}: changed" in out and "Approved 0" in out, out
+    assert json.loads((_store(home) / f"{pid}.json").read_text())["payload"]["name"] == "new-unreviewed"
+    assert not (_store(home) / f"{pid}.applying.json").exists()
+
+
+def test_restore_without_atomic_primitives_never_overwrites_a_staged_record(home, monkeypatch):
+    import uuid as uuid_mod
+    pid = _stage_skill("restored")
+    original = (_store(home) / f"{pid}.json").read_text()
+    monkeypatch.setattr(wa, "_renameat_noreplace", lambda *a: False, raising=False)
+
+    def no_links(*a, **k):
+        raise PermissionError("no hard links on this filesystem")
+
+    monkeypatch.setattr(os, "link", no_links)
+    real_rename, real_uuid, threads, forced = os.rename, uuid_mod.uuid4, [], []
+
+    def collide():
+        if not forced:
+            forced.append(1)
+            return uuid_mod.UUID(pid + "0" * 24)
+        return real_uuid()
+
+    def rename(src, dst, *a, **k):
+        if str(src).endswith(f"{pid}.applying.json") and not threads:  # the restore: another surface stages now
+            monkeypatch.setattr(uuid_mod, "uuid4", collide)
+            t = threading.Thread(target=lambda: _stage_skill("newcomer-to-preserve"))
+            t.start()
+            threads.append(t)
+        return real_rename(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "rename", rename)
+    _patch_applier(monkeypatch, lambda payload: json.dumps({"success": False, "error": "nope"}))
+    out = _skills(f"approve {pid}")
+    threads[0].join()
+    assert f"{pid}: failed (nope); left pending" in out, out
+    assert (_store(home) / f"{pid}.json").read_text() == original
+    assert {r["payload"]["name"] for r in wa.list_pending(wa.SKILLS)} == {"restored", "newcomer-to-preserve"}
+
+
+# ── round 3: a busy store stops the batch once; locks are per store ─────────
+
+def test_a_store_lock_timeout_stops_the_batch_once(home, monkeypatch):
+    first, second, third = _stage_skill("to-a"), _stage_skill("to-b"), _stage_skill("to-c")
+    real_lock, calls = wa._store_lock, []
+
+    def lock(subsystem, *a, **k):
+        calls.append(1)
+        if len(calls) >= 3:  # id1 claim + release took it; id2's claim times out
+            raise wa.PendingStoreError("Timed out waiting for the skills pending store")
+        return real_lock(subsystem, *a, **k)
+
+    monkeypatch.setattr(wa, "_store_lock", lock)
+    out = _skills(f"approve {first} {second} {third}")
+    assert f"{first}: approved" in out and f"{second}: not applied — Timed out" in out, out
+    assert f"{third}: not attempted" in out and len(calls) == 3, (out, len(calls))
+
+
+def test_holding_one_stores_lock_does_not_unlock_another(home, tmp_path, monkeypatch):
+    other = tmp_path / "other-profile"
+    other.mkdir()
+    monkeypatch.setattr(wa, "_LOCK_TIMEOUT_S", 0.2, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(other))
+    theirs = _stage_skill("theirs")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _stage_skill("ours")
+    result = {}
+    with wa._store_lock(wa.SKILLS):
+        monkeypatch.setenv("HERMES_HOME", str(other))
+        with wa._store_lock(wa.SKILLS):  # same thread, another profile's store: must really lock it too
+
+            def probe():  # runs with HERMES_HOME=other (process env)
+                try:
+                    result["state"] = wa.discard_pending(wa.SKILLS, theirs)
+                except wa.PendingStoreError as e:
+                    result["error"] = str(e)
+
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+    assert "error" in result and "Timed out" in result["error"], result
+    assert (other / "pending" / "skills" / f"{theirs}.json").exists()
 
 
 # ── 6. a claimed id is not pending ───────────────────────────────────────────

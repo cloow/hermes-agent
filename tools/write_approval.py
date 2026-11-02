@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
-from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +72,9 @@ def _normalize_enabled(value: Any) -> bool:
 _PENDING_ID_RE = re.compile(r"[0-9a-f]{8}")
 # ``<id>.json`` moves here while an approval applies it; a leftover one needs a human (see claim_pending).
 _CLAIM_SUFFIX = ".applying.json"
-_STORE_LOCK = ".store.lock"
-_store_lock_holder = threading.local()
+_STORE_LOCK = ".store.lock"  # Windows only: POSIX locks the pinned store directory itself
+_LOCK_TIMEOUT_S = 15.0
+_nt_lock_holders: dict[str, threading.local] = {}
 
 # Store states of one id (peek_pending, claim_pending, discard_pending).
 PENDING, CLAIMED, MISSING, BUSY, INVALID, CHANGED, STORE_ERROR, DISCARDED = (
@@ -170,19 +170,37 @@ def _read_record(path: Path, subsystem: str, pending_id: str) -> Optional[dict[s
 def stage_write(subsystem: str, payload: dict[str, Any], *, summary: str, origin: str) -> dict[str, Any]:
     """Persist a pending write and return its record (``id`` + metadata). ``payload`` is the exact
     kwargs to replay the write on approval; ``origin`` is ``foreground`` or ``background_review``.
+    Published under the store lock and never over an existing name, so a staged write can never
+    replace a record (or a claim) an approval is checking, moving or restoring.
     Best-effort: on disk failure it logs and still returns a record — the write is lost, which is
     the safe failure for an approval gate (nothing silently committed)."""
-    pid = uuid.uuid4().hex[:8]
     record = {
-        "id": pid, "subsystem": subsystem, "action": payload.get("action", ""),
+        "id": uuid.uuid4().hex[:8], "subsystem": subsystem, "action": payload.get("action", ""),
         "summary": (summary or "").strip(), "origin": origin or "foreground",
         "created_at": time.time(), "payload": payload,
     }
     try:
-        atomic_json_write(_pending_path(subsystem, pid), record)
+        with _store_lock(subsystem, create=True) as st:
+            for _ in range(8):
+                if not (st.lexists(f"{record['id']}.json") or st.lexists(f"{record['id']}{_CLAIM_SUFFIX}")):
+                    try:
+                        st.publish(f"{record['id']}.json", _record_bytes(record))
+                        break
+                    except FileExistsError:
+                        pass
+                record["id"] = uuid.uuid4().hex[:8]
+            else:
+                raise FileExistsError(f"no free pending id in {st.path}")
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
     return record
+
+
+def _record_bytes(record: dict[str, Any]) -> bytes:
+    try:
+        return json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:  # surrogate-escaped text (non-UTF-8 paths) is kept as escapes
+        return json.dumps(record, indent=2, ensure_ascii=True).encode("utf-8")
 
 
 def list_pending(subsystem: str) -> list[dict[str, Any]]:
@@ -328,6 +346,22 @@ class _Store:
     def unlink(self, name: str) -> None:
         os.unlink(self._p(name), **self._kw())
 
+    def publish(self, name: str, data: bytes) -> None:
+        """Write ``data`` to a private temp file, then give it ``name`` without replacing anything."""
+        tmp = f".{name}.{uuid.uuid4().hex}.tmp"
+        fd = os.open(self._p(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
+                     **self._kw())
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            self.move_no_replace(tmp, name)
+        except BaseException:
+            with suppress(OSError):
+                self.unlink(tmp)
+            raise
+
     def move_no_replace(self, src: str, dst: str) -> None:
         """Give the file named ``src`` the name ``dst``, never replacing ``dst`` (FileExistsError) and
         never dropping a ``src`` that stopped naming the moved file (_Changed)."""
@@ -344,47 +378,95 @@ class _Store:
                 os.link(src, dst, **kw)
         except (FileExistsError, FileNotFoundError):
             raise
-        except OSError:  # no hard links either: a rename the store lock keeps from replacing a store file
+        except OSError:  # no hard links either: every store writer holds the lock, so nothing appears at dst
             if self.lexists(dst):
                 raise FileExistsError(errno.EEXIST, "already exists", dst) from None
             os.rename(src, dst, **kw)
             return
         linked = self.identity(dst)
-        if self.identity(src) != linked:  # src was replaced after the link: keep the newcomer, undo ours
-            with suppress(OSError):
-                if self.identity(dst) == linked:
-                    self.unlink(dst)
-            raise _Changed(src)
+        # Drop the old name without a check-then-unlink window: move whatever ``src`` names now to a
+        # fresh private name (a rename to a new name replaces nothing), and delete it only if it is the
+        # inode we linked; anything else is a newcomer, which goes back under ``src`` untouched.
+        aside = f".{src}.{uuid.uuid4().hex}.aside"
         try:
-            self.unlink(src)
+            os.rename(src, aside, src_dir_fd=self.fd, dst_dir_fd=self.fd)
         except OSError:  # never leave one record under both names
             with suppress(OSError):
                 self.unlink(dst)
             raise
+        if self.identity(aside) == linked:
+            self.unlink(aside)
+            return
+        with suppress(OSError):  # src was replaced after the link: keep the newcomer, undo ours
+            if self.identity(dst) == linked:
+                self.unlink(dst)
+        try:
+            os.link(aside, src, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            self.unlink(aside)
+        except OSError:
+            logger.warning("write_approval: a record replaced mid-claim is kept as %s/%s", self.path, aside)
+        raise _Changed(src)
 
 
 @contextmanager
-def _store_lock(subsystem: str):
+def _store_lock(subsystem: str, *, create: bool = False):
     """Hold the subsystem's cross-process store lock and yield the pinned :class:`_Store`, or None when
-    the store does not exist (nothing to change: a lock must never create a deleted profile's dirs)."""
+    the store does not exist and ``create`` is off (nothing to change; only staging creates the store,
+    through mkdir_under_hermes_home, so a lock never conjures a deleted profile's directories).
+
+    POSIX: the directory is opened without following links, checked to be the store, and locked
+    itself (flock on that fd) — no lock file, so nothing is ever opened through a path that a link
+    could redirect. Not re-entrant: no store operation runs another one while holding the lock."""
     d = _pending_dir(subsystem)
+    if create:
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(d)
+    if os.name == "nt":
+        with _nt_store_lock(subsystem, d) as st:
+            yield st
+        return
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        yield None
+        return
+    except OSError as e:  # ELOOP / ENOTDIR: the store itself was replaced by a link or a file
+        raise PendingStoreError(f"the {subsystem} pending store {d} is not a plain directory ({e})") from e
+    try:
+        _flock_with_deadline(fd, subsystem)
+        pinned, now = os.fstat(fd), os.stat(_pending_dir(subsystem), follow_symlinks=False)
+        if (pinned.st_dev, pinned.st_ino) != (now.st_dev, now.st_ino):  # swapped after it was opened
+            raise PendingStoreError(f"the {subsystem} pending store {d} changed while it was opened")
+        yield _Store(d, fd)
+    finally:
+        os.close(fd)  # also releases the flock
+
+
+def _flock_with_deadline(fd: int, subsystem: str) -> None:
+    import fcntl  # windows-footgun: ok — POSIX only (the nt branch of _store_lock takes _nt_store_lock)
+    deadline = time.monotonic() + _LOCK_TIMEOUT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise PendingStoreError(f"Timed out waiting for the {subsystem} pending store") from None
+            time.sleep(0.05)
+
+
+@contextmanager
+def _nt_store_lock(subsystem: str, d: Path):
+    """Windows: no directory fds, so the store path is re-checked under a lock file inside it."""
     if not d.is_dir():
         yield None
         return
     from hermes_cli.auth import _file_lock
+    lock_path = d / _STORE_LOCK
+    holder = _nt_lock_holders.setdefault(str(lock_path), threading.local())  # one holder per lock path
     try:
-        with _file_lock(d / _STORE_LOCK, _store_lock_holder, 15.0, f"Timed out waiting for the {subsystem} pending store"):
-            if os.name == "nt":
-                yield _Store(_pending_dir(subsystem), None)  # re-checked under the lock
-                return
-            fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                pinned, now = os.fstat(fd), os.stat(_pending_dir(subsystem), follow_symlinks=False)
-                if (pinned.st_dev, pinned.st_ino) != (now.st_dev, now.st_ino):  # swapped after the check
-                    raise PendingStoreError(f"the {subsystem} pending store {d} changed while it was opened")
-                yield _Store(d, fd)
-            finally:
-                os.close(fd)
+        with _file_lock(lock_path, holder, _LOCK_TIMEOUT_S, f"Timed out waiting for the {subsystem} pending store"):
+            yield _Store(_pending_dir(subsystem), None)
     except TimeoutError as e:
         raise PendingStoreError(str(e)) from e
 
@@ -425,6 +507,8 @@ def claim_pending(subsystem: str, pending_id: str, expected: Optional[dict[str, 
         return BUSY, None
     except FileNotFoundError:
         return MISSING, None
+    except PendingStoreError:
+        raise  # the whole store is unusable right now: the command reports it once and stops
     except OSError:
         logger.warning("write_approval: could not claim %s/%s", subsystem, pending_id, exc_info=True)
         return STORE_ERROR, None

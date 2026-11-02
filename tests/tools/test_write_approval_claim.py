@@ -290,15 +290,18 @@ def test_a_store_that_refuses_the_claim_leaves_the_record_pending(home, monkeypa
 def test_a_failed_unlink_after_the_claim_link_leaves_one_name(home, monkeypatch):
     import os
     pid = _stage_skill("half-moved")
-    real_unlink = os.unlink
+    real_unlink, real_rename = os.unlink, os.rename
 
-    def flaky(path, *a, **k):
-        if str(path).endswith(f"{pid}.json") and not str(path).endswith(".applying.json"):
-            raise PermissionError("sticky directory")
-        return real_unlink(path, *a, **k)
+    def refuses_source(real):
+        def call(path, *a, **k):
+            if str(path).endswith(f"{pid}.json") and not str(path).endswith(".applying.json"):
+                raise PermissionError("sticky directory")  # the old name cannot be dropped
+            return real(path, *a, **k)
+        return call
 
     monkeypatch.setattr(wa, "_renameat_noreplace", lambda *a: False, raising=False)  # exercise the hard-link fallback
-    monkeypatch.setattr(os, "unlink", flaky)
+    monkeypatch.setattr(os, "unlink", refuses_source(real_unlink))
+    monkeypatch.setattr(os, "rename", refuses_source(real_rename))
     _patch_applier(monkeypatch, lambda payload: pytest.fail("an unclaimed record must not be applied"))
     out = _skills(f"approve {pid}")
     assert f"{pid}: could not be claimed" in out, out
